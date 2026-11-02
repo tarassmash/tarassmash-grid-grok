@@ -300,6 +300,23 @@ class Grid:
 
 # ---------------------------------------------------------------- main
 
+def normalize_args(text, parser):
+    """BOT_ARGS из переменной Railway: понимает 'budget 15', '—budget 15', 'budget=15', 'tp-usdt 1'."""
+    known = {o.lstrip("-") for act in parser._actions for o in act.option_strings}
+    text = text.replace("—", "--").replace("–", "--").replace("−", "-")
+    out = []
+    for tok in shlex.split(text):
+        name, eq, val = tok.lstrip("-").partition("=")
+        name = name.replace("_", "-").lower()
+        if name in known:
+            out.append("--" + name)
+            if eq:
+                out.append(val)
+        else:
+            out.append(tok.replace(",", "."))   # 15,5 -> 15.5
+    return out
+
+
 def check_access(s, a):
     """Проверка, что Bybit доступен с этого сервера и ключи рабочие."""
     try:
@@ -344,8 +361,10 @@ def main():
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     # На Railway параметры удобно задавать переменной BOT_ARGS, например:
     #   BOT_ARGS=--budget 30 --leverage 3 --tp-usdt 1
-    argv = sys.argv[1:] or shlex.split(os.getenv("BOT_ARGS", ""))
-    a = p.parse_args(argv)
+    argv = sys.argv[1:] or normalize_args(os.getenv("BOT_ARGS", ""), p)
+    a, unknown = p.parse_known_args(argv)
+    if unknown:
+        print("BOT_ARGS: не понял и пропускаю: " + " ".join(unknown), flush=True)
     a.max_levels = max(2, min(40, a.max_levels))
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S",
