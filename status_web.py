@@ -33,6 +33,7 @@ LOCK = threading.Lock()
 # Управление со страницы. paused=True: бот закрывает текущую сетку и не открывает новые.
 CONTROL = {"paused": os.getenv("START_PAUSED", "") == "1", "msg": ""}
 CONTROL_KEY = os.getenv("CONTROL_KEY", "")
+BRAIN = None   # нейросеть бота (nn.Brain), задаёт bybit_grid_bot.main()
 
 
 def update(**kw):
@@ -55,7 +56,101 @@ def snapshot():
     data["control_msg"] = CONTROL["msg"]
     data["uptime_min"] = round((time.time() - STATUS["started"]) / 60, 1)
     data["logs"] = list(LOGS)[-60:]
+    data["nn"] = BRAIN.status() if BRAIN else None
     return data
+
+
+def svg_chart(series, w=560, h=190, xlabels=None, unit="", zero=False):
+    """Простой линейный график в SVG. series: [(название, цвет, [значения])]."""
+    vals = [v for _, _, ys in series for v in ys if v is not None]
+    if not vals:
+        return '<p class="muted">Данных для графика пока нет</p>'
+    lo, hi = min(vals), max(vals)
+    if zero:
+        lo, hi = min(lo, 0), max(hi, 0)
+    if hi - lo < 1e-12:
+        hi, lo = hi + 1, lo - 1
+    pad_l, pad_r, pad_t, pad_b = 58, 14, 10, 22
+
+    def num(v):
+        a = abs(v)
+        if a >= 1e6:
+            return f"{v / 1e6:.1f}M"
+        if a >= 1e3:
+            return f"{v / 1e3:.1f}k"
+        return f"{v:.3g}"
+    n = max(len(ys) for _, _, ys in series)
+    X = lambda i: pad_l + (w - pad_l - pad_r) * (i / max(n - 1, 1))  # noqa: E731
+    Y = lambda v: pad_t + (h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))  # noqa: E731
+    out = [f'<svg viewBox="0 0 {w} {h}" class="chart" role="img">']
+    for k in range(5):
+        v = lo + (hi - lo) * k / 4
+        y = Y(v)
+        out.append(f'<line x1="{pad_l}" x2="{w - pad_r}" y1="{y:.1f}" y2="{y:.1f}" class="grid"/>'
+                   f'<text x="{pad_l - 6}" y="{y + 4:.1f}" text-anchor="end" class="ax">{num(v)}{unit}</text>')
+    if zero and lo < 0 < hi:
+        out.append(f'<line x1="{pad_l}" x2="{w - pad_r}" y1="{Y(0):.1f}" y2="{Y(0):.1f}" class="zero"/>')
+    if xlabels:
+        for i in sorted({0, n // 2, n - 1}):
+            if 0 <= i < len(xlabels):
+                anchor = "start" if i == 0 else ("end" if i == n - 1 else "middle")
+                out.append(f'<text x="{X(i):.1f}" y="{h - 5}" text-anchor="{anchor}" class="ax">{escape(str(xlabels[i]))}</text>')
+    for name, color, ys in series:
+        pts = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in enumerate(ys) if v is not None)
+        out.append(f'<polyline points="{pts}" fill="none" style="stroke:{color}" stroke-width="2" stroke-linejoin="round"/>')
+        if ys and ys[-1] is not None:
+            out.append(f'<circle cx="{X(len(ys) - 1):.1f}" cy="{Y(ys[-1]):.1f}" r="3.5" style="fill:{color}"/>')
+    out.append("</svg>")
+    legend = "".join(f'<span class="lg"><i style="background:{c}"></i>{escape(nm)}</span>' for nm, c, _ in series)
+    return "".join(out) + f'<div class="legend">{legend}</div>'
+
+
+def render_nn(nn):
+    if not nn:
+        return ""
+    hist = nn["history"]
+    curve = nn["curve"]
+    last = hist[-1] if hist else None
+    pill = ('<span class="nnpill on">ПРИНИМАЕТ РЕШЕНИЯ</span>' if nn["active"]
+            else '<span class="nnpill off">УЧИТСЯ</span>')
+    if not nn["enabled"]:
+        pill += ' <span class="nnpill off">решения выключены (--no-nn)</span>'
+    kv = f"""<div class="kv">
+      <div><span>Состояние</span><b>{escape(nn['text'])}</b></div>
+      <div><span>Примеров</span><b>{nn['samples']:,}</b></div>
+      <div><span>Из них реальных сеток</span><b>{nn['real']}</b></div>
+      <div><span>Обучений</span><b>{len(hist)}</b></div>
+      {f'<div><span>Последнее: отбор сети</span><b class="{"pos" if last["sel_avg"] > 0 else "neg"}">{last["sel_avg"]:+.3f}%</b></div>' if last else ''}
+      {f'<div><span>Последнее: все сетки сканера</span><b class="{"pos" if last["base_avg"] > 0 else "neg"}">{last["base_avg"]:+.3f}%</b></div>' if last else ''}
+      {f'<div><span>Связь прогноза с итогом</span><b>{last["corr"]:+.2f}</b></div>' if last else ''}
+    </div>"""
+    prog = f'<p class="muted small">Сейчас: {escape(nn["progress"])}</p>' if nn["progress"] else ""
+    ch1 = svg_chart([("ошибка на обучении", "var(--acc)", [c["train"] for c in curve]),
+                     ("ошибка на проверке", "var(--warn)", [c["val"] for c in curve])],
+                    xlabels=[f"эп. {c['epoch']}" for c in curve])
+    labels = [time.strftime("%d.%m %H:%M", time.gmtime(r["time"] / 1000)) for r in hist]
+    ch2 = svg_chart([("сетки, отобранные сетью", "var(--pos)", [r["sel_avg"] for r in hist]),
+                     ("все сетки сканера", "var(--muted)", [r["base_avg"] for r in hist])],
+                    xlabels=labels, unit="%", zero=True)
+    ch3 = svg_chart([("всего примеров", "var(--acc)", [r["samples"] for r in hist]),
+                     ("реальных сеток ×100", "var(--warn)", [r["real"] * 100 for r in hist])], xlabels=labels)
+    preds = "".join(
+        f"<tr><td>{escape(x['symbol'])}</td><td>{'—' if x['pred'] is None else '%+.3f%%' % x['pred']}</td>"
+        f"<td>{x['levels']}</td><td>{x['mult']:g}×</td><td class=\"{'pos' if x['take'] else 'neg'}\">{'беру' if x['take'] else 'пропуск'}</td></tr>"
+        for x in nn["preds"]) or '<tr><td colspan="5" class="muted">Прогнозов ещё нет — дождись скана</td></tr>'
+    return f"""
+<div class="panel"><h2>Нейросеть {pill}</h2>{kv}{prog}
+  <p class="muted small">Учится на учебных сетках по свежим свечам и на каждой закрытой реальной сетке (вес ×3).
+  Решения принимает, только если на проверке (последние 20% данных, которых при обучении не было) сетки, которые она отбирает,
+  в плюсе и лучше всех сеток сканера. Прогноз — доходность сетки в % от объёма позиции за {escape(str(nn.get('horizon', 60)))} мин.</p>
+</div>
+<div class="charts">
+  <div class="panel"><h2>Последнее обучение: ошибка по эпохам</h2>{ch1}</div>
+  <div class="panel"><h2>Качество на проверке по обучениям</h2>{ch2}</div>
+  <div class="panel"><h2>Сколько данных накоплено</h2>{ch3}</div>
+  <div class="panel"><h2>Прогнозы по текущим кандидатам</h2>
+    <div class="scroll"><table><tr><th>Монета</th><th>Прогноз</th><th>Уровней</th><th>Шаг</th><th>Решение</th></tr>{preds}</table></div></div>
+</div>"""
 
 
 def _fmt(v, nd=4):
@@ -90,9 +185,10 @@ def render():
 
     rows = "".join(
         f"<tr><td>{escape(c['symbol'])}</td><td>{c['vol1m']:.2f}%</td><td>{c['atr']:.2f}%</td>"
-        f"<td>{c['er']:.2f}</td><td>{c['score']:.2f}</td></tr>"
+        f"<td>{c['er']:.2f}</td><td>{c['score']:.2f}</td>"
+        f"<td>{'—' if c.get('pred') is None else '%+.3f%%' % c['pred']}</td></tr>"
         for c in s["scan"]["top"]
-    ) or '<tr><td colspan="5" class="muted">Скан ещё не прошёл</td></tr>'
+    ) or '<tr><td colspan="6" class="muted">Скан ещё не прошёл</td></tr>'
 
     hist = "".join(
         f"<tr><td>{escape(h['time'])}</td><td>{escape(h['symbol'])}</td><td>{h['fills']}</td>"
@@ -114,7 +210,7 @@ def render():
   <button formaction="/api/stop" class="stop" {'disabled' if paused else ''}>Стоп</button>
   <span class="cstate {'off' if paused else 'on'}">{'На паузе' if paused else 'Торгует'}</span>{msg}
 </form>
-<p class="muted small">«Стоп» снимает ордера, закрывает позицию по рынку и ставит бота на паузу. «Старт» снова ищет монету и ставит сетку.</p>"""
+<p class="muted small">«Стоп» снимает ордера, закрывает позицию лимитками с догоном и ставит бота на паузу. «Старт» снова ищет монету и ставит сетку.</p>"""
 
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -140,7 +236,14 @@ td:first-child,th:first-child{{text-align:left}}th{{font:600 11px system-ui;colo
 .ctrl button:disabled{{opacity:.35;cursor:default}}
 .start{{background:var(--acc);color:#06231a}}.stop{{background:var(--neg);color:#2a0705}}
 .cstate{{font-weight:700}}.cstate.on{{color:var(--pos)}}.cstate.off{{color:var(--warn)}}
-.cmsg{{color:var(--muted);font-size:13px}}.small{{font-size:12px;margin:8px 0 0}}
+.cmsg{{color:var(--muted);font-size:13px}}
+.charts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:14px}}
+.chart{{width:100%;height:auto;display:block}}.chart .grid{{stroke:var(--line);stroke-width:1}}
+.chart .zero{{stroke:var(--muted);stroke-width:1;stroke-dasharray:4 3}}.chart .ax{{fill:var(--muted);font:11px ui-monospace,monospace}}
+.legend{{display:flex;flex-wrap:wrap;gap:12px;margin-top:6px;font-size:12px;color:var(--muted)}}
+.lg i{{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}}
+.nnpill{{font-size:11px;padding:2px 8px;border-radius:999px;margin-left:6px;letter-spacing:.04em}}
+.nnpill.on{{background:#1d3a2f;color:var(--pos)}}.nnpill.off{{background:#3a2f17;color:var(--warn)}}.small{{font-size:12px;margin:8px 0 0}}
 pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d6d0;white-space:pre-wrap}}
 </style></head><body><div class="wrap">
 <div class="top"><h1>Vol Grid Bot</h1><span class="pill">{escape(str(s['mode']))}</span></div>
@@ -154,7 +257,8 @@ pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mo
 </div></div>
 <div class="panel"><h2>Текущая сетка</h2>{grid_html}</div>
 <div class="panel"><h2>Последний скан · {scan_t} · проверено {s['scan']['checked']}, подошло {s['scan']['passed']}</h2>
-<div class="scroll"><table><tr><th>Монета</th><th>1m размах</th><th>ATR</th><th>ER</th><th>Score</th></tr>{rows}</table></div></div>
+<div class="scroll"><table><tr><th>Монета</th><th>1m размах</th><th>ATR</th><th>ER</th><th>Score</th><th>Прогноз сети</th></tr>{rows}</table></div></div>
+{render_nn(s.get("nn"))}
 <div class="panel"><h2>Закрытые сетки</h2>
 <div class="scroll"><table><tr><th>Время</th><th>Монета</th><th>Исполн.</th><th>Прибыль ≈</th><th>Причина</th></tr>{hist}</table></div></div>
 <div class="panel"><h2>Лог (новое сверху)</h2><pre>{logs}</pre></div>

@@ -46,7 +46,10 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from pybit.unified_trading import HTTP
 
+import nn
 import status_web as web
+
+BRAIN = None   # встроенная нейросеть (nn.Brain), создаётся в main()
 
 log = logging.getLogger("grid")
 CAT = "linear"
@@ -158,11 +161,13 @@ def scan(s, inst, a):
 
     def one(sym):
         try:
-            m = analyze(klines(s, sym, a.window + 1), a)
+            kl = klines(s, sym, a.window + 1)
+            m = analyze(kl, a)
         except Exception:  # noqa: BLE001
             return None
         if m:
             m["symbol"] = sym
+            m["nn_base"] = nn.base_features(kl, m)
         return m
 
     with ThreadPoolExecutor(max_workers=6) as ex:
@@ -170,13 +175,43 @@ def scan(s, inst, a):
     res = [r for r in res if r["er"] <= a.max_er and r["turnover"] >= a.min_vol_win
            and r["vol1m"] >= a.min_1m]
     res.sort(key=lambda r: r["score"], reverse=True)
+    res = apply_brain(res, a)
     log.info("Скан: %d пар по объёму, %d прошли фильтры", len(syms), len(res))
     web.update(scan={"time": time.time(), "checked": len(syms), "passed": len(res),
-                     "top": [{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")} for r in res[:10]]})
+                     "top": [{**{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")},
+                              "pred": r["nn"]["pred"], "levels": r["grids"]} for r in res[:10]]})
     for r in res[:5]:
         log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f score=%.2f",
                  r["symbol"], r["vol1m"], r["atr"], r["er"], r["score"])
     return res
+
+
+def apply_brain(res, a):
+    """Нейросеть оценивает каждого кандидата и вариант шага сетки.
+    Активна (прошла проверку) — выбирает шаг, сортирует по прогнозу и отсекает ожидаемый минус.
+    Не активна — бот работает по сканеру, а сеть запоминает признаки для обучения."""
+    if not BRAIN:
+        return res
+    out, preds = [], []
+    use = a.nn and BRAIN.active
+    for c in res:
+        levels, pred, feats = BRAIN.choose(c)
+        if not use:
+            feats, levels_base = nn.variant(c["nn_base"], 1.0, a.max_levels)
+            c["nn"] = {"pred": pred, "feats": feats, "levels": levels_base}
+        else:
+            c["nn"] = {"pred": pred, "feats": feats, "levels": levels}
+            c["grids"] = levels
+        preds.append({"symbol": c["symbol"], "pred": pred, "levels": levels,
+                      "mult": feats["mult"] if feats else 1.0, "take": (not use) or (pred is not None and pred > a.nn_min_edge)})
+        if use and (pred is None or pred <= a.nn_min_edge):
+            continue
+        out.append(c)
+    if use:
+        out.sort(key=lambda c: c["nn"]["pred"], reverse=True)
+        preds.sort(key=lambda x: x["pred"] if x["pred"] is not None else -99, reverse=True)
+    BRAIN.preds = preds
+    return out
 
 
 # ---------------------------------------------------------------- grid
@@ -282,6 +317,8 @@ class Grid:
         self.price = float(price)
         self.er_checked = 0.0
         self.closing = ""
+        self.nn = cand.get("nn")
+        self.notional = float(self.qty) * self.n * float(price)
 
     # --- уровни
     def set_levels(self, lo, hi):
@@ -424,7 +461,10 @@ class Grid:
             self.book(side, idx, float(info.get("avgPrice") or self.levels[i]), done)
         if st == "Filled":
             self.fills += 1
-            self.want.pop(i, None)
+            # уровень освобождается, только если там всё ещё ждал этот ордер: если за ту же секунду
+            # исполнился соседний и уже поставил сюда встречный, его не трогаем
+            if self.want.get(i) == (side, idx):
+                self.want.pop(i, None)
             # встречная лимитка на соседний уровень, по той же ноге (positionIdx)
             if side == "Buy" and i + 1 <= self.n:
                 self.want[i + 1] = ("Sell", idx)
@@ -529,6 +569,10 @@ class Grid:
             log.error("%s: позиция ещё не закрыта, продолжаю догон лимитками", self.sym)
             return False
         log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
+        if BRAIN and self.nn and self.notional > 0:
+            pnl = self.pnl() - self.a.fee / 100 * abs(self.net) * self.price
+            BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100)
+            log.info("%s: результат записан в обучение нейросети (%+.3f%% от объёма)", self.sym, pnl / self.notional * 100)
         with web.LOCK:
             web.STATUS["history"].append({"time": time.strftime("%d.%m %H:%M UTC", time.gmtime()), "symbol": self.sym,
                                           "fills": self.fills, "profit": self.pnl(), "reason": reason})
@@ -636,6 +680,16 @@ def main():
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
+    # нейросеть
+    p.add_argument("--no-nn", dest="nn", action="store_false", help="не давать нейросети принимать решения (учится всё равно)")
+    p.add_argument("--nn-min-edge", type=float, default=0.02, help="брать сетку, если прогноз выше X %% от объёма")
+    p.add_argument("--nn-symbols", type=int, default=30, help="монет для учебных сеток")
+    p.add_argument("--nn-stride", type=int, default=5, help="шаг (мин) между учебными сетками")
+    p.add_argument("--nn-refresh", type=float, default=60, help="раз в N минут — новые учебные сетки")
+    p.add_argument("--nn-retrain-every", type=int, default=500, help="переобучать после N новых примеров")
+    p.add_argument("--nn-epochs", type=int, default=60)
+    p.add_argument("--nn-max-samples", type=int, default=60000)
+    p.add_argument("--nn-path", default=os.getenv("NN_PATH") or ("/data/nn" if os.path.isdir("/data") else "data/nn"))
     # На Railway параметры удобно задавать переменной BOT_ARGS, например:
     #   BOT_ARGS=--budget 30 --leverage 3 --tp-usdt 1
     argv = sys.argv[1:] or normalize_args(os.getenv("BOT_ARGS", ""), p)
@@ -672,6 +726,18 @@ def main():
         wait_forever(err)
     inst = load_instruments(s)
     log.info("Инструментов: %d", len(inst))
+
+    global BRAIN
+    market = HTTP(testnet=False)   # учебные сетки — по реальным свечам
+
+    def liquid():
+        t = api(market.get_tickers, category=CAT)["result"]["list"]
+        t = [x for x in t if x["symbol"] in inst and float(x.get("turnover24h") or 0) >= a.min_vol]
+        t.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
+        return [x["symbol"] for x in t]
+    BRAIN = nn.Brain(a.nn_path, a, market, analyze, klines, liquid)
+    BRAIN.start()
+    web.BRAIN = BRAIN
     last_bal = time.time()
 
     cooldown = {}
