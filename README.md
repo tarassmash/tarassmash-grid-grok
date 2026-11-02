@@ -14,18 +14,18 @@
 | `BYBIT_API_KEY` | ключ API |
 | `BYBIT_API_SECRET` | секрет API |
 | `BOT_ARGS` | параметры бота, например `--budget 30 --leverage 3 --tp-usdt 1` |
-| `CONFIRM_LIVE` | `YES` — только для реального счёта вместе с `--live` в `BOT_ARGS` |
 | `HTTPS_PROXY` | (если Bybit блокирует IP Railway) `socks5://user:pass@host:port` или `http://…` |
 
 4. Открой **Deployments → View logs**. В начале должно быть `Ключи OK, баланс USDT: …`.
 
-Без `--live` бот работает на **testnet** (ключи с testnet.bybit.com).
+Бот сразу торгует на **реальном счёте**. Для учебного счёта добавь `--testnet` в `BOT_ARGS`
+(или переменную `BYBIT_ENV=testnet`) и ключи с testnet.bybit.com.
 
 ## Параметры (BOT_ARGS)
 
 | Флаг | По умолчанию | Что делает |
 |---|---|---|
-| `--live` | выкл | реальный счёт |
+| `--testnet` | выкл | учебный счёт вместо реального |
 | `--dry` | выкл | только показывать план, без ордеров |
 | `--budget` | 50 | маржа на одну сетку, USDT |
 | `--leverage` | 3 | плечо |

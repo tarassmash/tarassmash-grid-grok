@@ -26,8 +26,8 @@ Bybit: сканер волатильности + авто нейтральная
 
 Запуск:
   python bybit_grid_bot.py --dry            # только показать, что бы поставил (ключи не нужны)
-  python bybit_grid_bot.py                  # TESTNET (по умолчанию), ключи от testnet.bybit.com
-  python bybit_grid_bot.py --live           # реальный счёт, спросит подтверждение
+  python bybit_grid_bot.py                  # РЕАЛЬНЫЙ счёт (по умолчанию)
+  python bybit_grid_bot.py --testnet        # учебный счёт, ключи от testnet.bybit.com
 
 Аккаунт должен быть в One-Way Mode (не Hedge) для USDT perpetual.
 Ctrl+C: бот отменит ордера и закроет позицию текущей сетки (если не указан --keep-on-exit).
@@ -321,7 +321,8 @@ def check_access(s, a):
 
 def main():
     p = argparse.ArgumentParser(description="Bybit volatility scanner + neutral grid bot")
-    p.add_argument("--live", action="store_true", help="реальный счёт (по умолчанию testnet)")
+    p.add_argument("--testnet", action="store_true", help="учебный счёт (по умолчанию реальный)")
+    p.add_argument("--live", action="store_true", help="оставлено для совместимости: реальный счёт и так по умолчанию")
     p.add_argument("--dry", action="store_true", help="без ордеров, только показать план")
     p.add_argument("--budget", type=float, default=50, help="маржа на одну сетку, USDT")
     p.add_argument("--leverage", type=float, default=3)
@@ -342,7 +343,7 @@ def main():
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     # На Railway параметры удобно задавать переменной BOT_ARGS, например:
-    #   BOT_ARGS=--live --budget 30 --leverage 3 --tp-usdt 1
+    #   BOT_ARGS=--budget 30 --leverage 3 --tp-usdt 1
     argv = sys.argv[1:] or shlex.split(os.getenv("BOT_ARGS", ""))
     a = p.parse_args(argv)
     a.max_levels = max(2, min(40, a.max_levels))
@@ -354,21 +355,18 @@ def main():
     key, sec = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
     if not a.dry and not (key and sec):
         sys.exit("Нет ключей: создай .env с BYBIT_API_KEY и BYBIT_API_SECRET (или запусти с --dry)")
-    if a.live and not a.dry:
-        print(f"РЕАЛЬНЫЙ СЧЁТ Bybit. Маржа на сетку {a.budget}$, плечо {a.leverage}x.", flush=True)
-        if os.getenv("CONFIRM_LIVE") != "YES":
-            if not sys.stdin.isatty():
-                sys.exit("Для реального счёта на сервере задай переменную CONFIRM_LIVE=YES")
-            if input("Напиши YES для запуска: ").strip() != "YES":
-                sys.exit("Отменено")
+    if os.getenv("BYBIT_ENV", "").lower() == "testnet":
+        a.testnet = True
+    live = not a.testnet
 
     # Railway при редеплое/остановке шлёт SIGTERM -> закрываем сетку как по Ctrl+C
     def _term(*_):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, _term)
 
-    s = HTTP(testnet=not a.live, api_key=key, api_secret=sec)
-    log.info("Режим: %s%s", "MAINNET" if a.live else "TESTNET", " (dry-run)" if a.dry else "")
+    s = HTTP(testnet=not live, api_key=key, api_secret=sec)
+    log.info("Режим: %s%s | маржа на сетку %s$, плечо %sx", "РЕАЛЬНЫЙ СЧЁТ" if live else "TESTNET",
+             " (dry-run)" if a.dry else "", a.budget, a.leverage)
     check_access(s, a)
     inst = load_instruments(s)
     log.info("Инструментов: %d", len(inst))
