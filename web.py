@@ -82,7 +82,7 @@ class Handler(BaseHTTPRequestHandler):
         if CONTROL_KEY and not hmac.compare_digest(str(data.get("key") or ""), CONTROL_KEY):
             return self.send(403, _json({"error": "Невірний ключ керування"}))
         action = data.get("action")
-        if action not in ("start", "pause", "close", "close_all"):
+        if action not in ("start", "pause", "close", "close_all", "optimize"):
             return self.send(400, _json({"error": "Невідома дія"}))
         BOT.command(action, data.get("symbol"))
         return self.send(200, _json({"ok": True}))

@@ -60,7 +60,16 @@ class Bot:
         self.state_path = a.state_path
         self.bt_cache = {}
         self.min_cache = {}
+        # настройки по каждой монете (подбираются автоматически), монеты без прибыльных настроек выключены
+        self.ps = {x: st.Params(**p.as_dict()) for x in self.syms}
+        self.enabled = {x: True for x in self.syms}
+        self.opt = {x: None for x in self.syms}
+        self.opt_state = {"running": False, "progress": "", "last_run": None, "error": ""}
+        self.opt_day = None
         self.load()
+        if a.auto_opt and a.auto_apply and self.opt_state["last_run"] is None:
+            # до первого подбора не торгуем настройками по умолчанию
+            self.enabled = {x: False for x in self.syms}
 
     # ------------------------------------------------------------ состояние
     def event(self, text, kind="info"):
@@ -74,7 +83,10 @@ class Bot:
             tmp = self.state_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"trades": self.trades, "journal": self.journal[-500:],
-                           "taken": [[k[0], k[1], v] for k, v in self.taken.items()]}, f, default=str)
+                           "taken": [[k[0], k[1], v] for k, v in self.taken.items()],
+                           "ps": {k: v.as_dict() for k, v in self.ps.items()}, "enabled": self.enabled,
+                           "opt": self.opt, "opt_day": self.opt_day, "opt_last": self.opt_state["last_run"]},
+                          f, default=str)
             os.replace(tmp, self.state_path)
         except Exception as e:  # noqa: BLE001
             log.warning("Не удалось сохранить состояние: %s", e)
@@ -86,6 +98,17 @@ class Bot:
             self.trades = data.get("trades") or {}
             self.journal = data.get("journal") or []
             self.taken = {(k[0], k[1]): k[2] for k in data.get("taken") or []}
+            for k, v in (data.get("ps") or {}).items():
+                if k in self.ps:
+                    self.ps[k] = st.Params(**{**v, "risk_pct": self.p.risk_pct, "fee_pct": self.p.fee_pct})
+            for k, v in (data.get("enabled") or {}).items():
+                if k in self.enabled:
+                    self.enabled[k] = bool(v)
+            for k, v in (data.get("opt") or {}).items():
+                if k in self.opt:
+                    self.opt[k] = v
+            self.opt_day = data.get("opt_day")
+            self.opt_state["last_run"] = data.get("opt_last")
             if self.trades:
                 log.info("Восстановлены открытые сделки: %s", ", ".join(self.trades))
         except FileNotFoundError:
@@ -123,7 +146,7 @@ class Bot:
             return None
         self.last_t[sym] = c["t"]
         lv = self.lv[sym]
-        self.check[sym] = {"candle": c, "items": st.checklist(c, lv["pdh"], lv["pdl"], self.p)}
+        self.check[sym] = {"candle": c, "items": st.checklist(c, lv["pdh"], lv["pdl"], self.ps[sym])}
         return c
 
     # ------------------------------------------------------------ вход
@@ -133,7 +156,7 @@ class Bot:
         return 0
 
     def enter(self, sym, side, c):
-        a, p, ins = self.a, self.p, self.ins[sym]
+        a, p, ins = self.a, self.ps[sym], self.ins[sym]
         ref = c["c"]
         if positions(self.s, sym):
             self.event(f"{sym}: сигнал {side}, но на монете уже есть позиция — пропускаю", "warn")
@@ -201,6 +224,7 @@ class Bot:
             "stop": lv["sl"], "be": False, "t_open": now_ms(), "signal_t": c["t"], "lev": lev,
             "pdh": self.lv[sym]["pdh"], "pdl": self.lv[sym]["pdl"], "tp_oid": None, "sl_oid": None,
             "out_since": None, "close_reason": "",
+            "sl_pct": p.sl_pct, "be_r": p.be_r, "tp_r": p.tp_r, "fee_pct": p.fee_pct,
         }
         self.place_tp(tr)
         self.place_stop(tr, lv["sl"])
@@ -209,8 +233,9 @@ class Bot:
         day = st.ny_day(c["t"]).isoformat()
         self.taken[(sym, day)] = self.taken.get((sym, day), 0) + 1
         self.save()
+        be_txt = f"Б/У на {lv['be_trigger']:g}" if lv["be_trigger"] is not None else "без Б/У"
         self.event(f"{sym}: ВХОД {'LONG' if side == 'Buy' else 'SHORT'} {filled} @ {entry:g} | SL {lv['sl']:g} | "
-                   f"Б/У на {lv['be_trigger']:g} | TP {lv['tp']:g}", "trade")
+                   f"{be_txt} | TP {lv['tp']:g}", "trade")
 
     # ------------------------------------------------------------ защитные ордера
     def close_side(self, tr):
@@ -276,7 +301,7 @@ class Bot:
         if pnl is None:
             exit_px = {"TP": tr["tp"], "SL": tr["stop"], "BE": tr["stop"]}.get(outcome, self.price.get(sym) or tr["entry"])
             d = 1 if tr["side"] == "Buy" else -1
-            pnl = (exit_px - tr["entry"]) * d * float(tr["qty"]) - self.p.fee_pct * 2 / 100 * tr["entry"] * float(tr["qty"])
+            pnl = (exit_px - tr["entry"]) * d * float(tr["qty"]) - tr.get("fee_pct", self.p.fee_pct) * 2 / 100 * tr["entry"] * float(tr["qty"])
         r_mult = pnl / tr["risk_usd"] if tr["risk_usd"] else 0
         rec = {**tr, "outcome": outcome, "pnl": pnl, "r": r_mult, "exit": exit_px, "t_close": now_ms()}
         with self.lock:
@@ -302,13 +327,14 @@ class Bot:
                 self.finish(tr, tr["close_reason"])
             return
         # перенос в безубыток на +2R
-        if not tr["be"] and price and ((price >= tr["be_trigger"]) if long else (price <= tr["be_trigger"])):
+        trig = tr.get("be_trigger")
+        if not tr["be"] and price and trig is not None and ((price >= trig) if long else (price <= trig)):
             if tr.get("sl_oid"):
                 cancel(self.s, sym, tr["sl_oid"])
             tr["be"] = True
             self.place_stop(tr, tr["be_stop"])
             self.save()
-            self.event(f"{sym}: +{self.p.be_r:g}R — стоп перенесён в безубыток {tr['stop']:g}", "trade")
+            self.event(f"{sym}: +{tr.get('be_r', self.p.be_r):g}R — стоп перенесён в безубыток {tr['stop']:g}", "trade")
         # страховка: цена за стопом, а позиция ещё открыта (стоп-лимит не исполнился или его нет)
         beyond = price and ((price < tr["stop"] * (1 - 0.0005)) if long else (price > tr["stop"] * (1 + 0.0005)))
         if beyond:
@@ -330,6 +356,9 @@ class Bot:
     def run_commands(self):
         while self.cmds:
             action, sym = self.cmds.popleft()
+            if action == "optimize":
+                self.start_optimize("по кнопке")
+                continue
             if action == "start":
                 self.paused = False
                 self.event("Автопилот запущен")
@@ -366,6 +395,7 @@ class Bot:
 
     def tick(self):
         self.run_commands()
+        self.maybe_optimize()
         for sym in self.syms:
             try:
                 self.refresh_levels(sym)
@@ -385,13 +415,14 @@ class Bot:
             except Exception as e:  # noqa: BLE001
                 log.warning("%s: свечи: %s", sym, e)
                 continue
-            if not c or self.paused or not st.in_session(c["t"], self.p):
+            p = self.ps[sym]
+            if not c or self.paused or not self.enabled[sym] or not st.in_session(c["t"], p):
                 continue
             day = st.ny_day(c["t"]).isoformat()
-            if self.taken.get((sym, day), 0) >= self.p.trades_per_day:
+            if self.taken.get((sym, day), 0) >= p.trades_per_day:
                 continue
             lv = self.lv[sym]
-            side = st.signal(c, lv["pdh"], lv["pdl"], self.p)
+            side = st.signal(c, lv["pdh"], lv["pdl"], p)
             if side and not self.a.dry:
                 try:
                     self.enter(sym, side, c)
@@ -417,6 +448,71 @@ class Bot:
                 self.refresh_wallet()
             time.sleep(max(0.2, self.a.poll - (time.time() - t0)))
 
+    # ------------------------------------------------------------ автоподбор настроек
+    def maybe_optimize(self):
+        """Раз в будний день, за --opt-before минут до окна NY — подбор настроек на свежих данных."""
+        if not self.a.auto_opt or self.opt_state["running"]:
+            return
+        t = now_ms()
+        day = st.ny_day(t)
+        if day.weekday() >= 5 or self.opt_day == day.isoformat():
+            return
+        s_ms, _ = st.session_bounds(day, self.p)
+        first_time = self.opt_state["last_run"] is None
+        if first_time or s_ms - self.a.opt_before * 60_000 <= t < s_ms:
+            self.opt_day = day.isoformat()
+            self.start_optimize("перед окном NY" if not first_time else "первый запуск")
+
+    def start_optimize(self, why):
+        if self.opt_state["running"]:
+            return
+        self.opt_state.update(running=True, progress="старт", error="")
+        threading.Thread(target=self.optimize_all, args=(why,), daemon=True).start()
+
+    def optimize_all(self, why):
+        self.event(f"Автоподбор настроек ({why}): {self.a.opt_days} дней, проверка на последних {self.a.opt_test}")
+        try:
+            for sym in self.syms:
+                def prog(i, n, sym=sym):
+                    self.opt_state["progress"] = f"{sym}: свечи {i}/{n}"
+                daily = klines(self.public, sym, "D", limit=self.a.opt_days + 10)
+                days = st.collect_days(daily, lambda d, sym=sym: self.minutes_for(sym, d), self.a.opt_days,
+                                       now_ms(), self.p.session_start, progress=prog)
+
+                def prog2(i, n, sym=sym):
+                    self.opt_state["progress"] = f"{sym}: варианты {i}/{n}"
+                res = st.optimize(days, self.p, test_days=self.a.opt_test, min_train=self.a.opt_min_trades,
+                                  progress=prog2)
+                with self.lock:
+                    self.opt[sym] = {**res, "time": now_ms()}
+                    if self.a.auto_apply:
+                        if res["applied"]:
+                            best = res["best"]["params"]
+                            self.ps[sym] = st.Params(**{**best, "risk_pct": self.p.risk_pct, "fee_pct": self.p.fee_pct,
+                                                        "trades_per_day": self.p.trades_per_day})
+                            self.enabled[sym] = True
+                        else:
+                            self.enabled[sym] = False
+                kind = "win" if res["applied"] else "warn"
+                self.event(f"{sym}: {res['reason']}", kind)
+                if res["applied"] and self.a.auto_apply:
+                    b = self.ps[sym]
+                    self.event(f"{sym}: настройки — стоп {b.sl_pct}%, тейк {b.tp_r}R, "
+                               f"Б/У {('+%gR' % b.be_r) if b.be_r > 0 else 'нет'}, касание {b.touch_pct}%, "
+                               f"тело ≥{b.strong_body:g}, окно {b.session_min} мин")
+                # кэш минуток только за нужные дни
+                keep = {(sym, x["d"].isoformat()) for x in days}
+                for k in [k for k in self.min_cache if k[0] == sym and k not in keep]:
+                    self.min_cache.pop(k, None)
+            self.bt_cache.clear()
+            self.opt_state["last_run"] = now_ms()
+            self.save()
+        except Exception as e:  # noqa: BLE001
+            self.opt_state["error"] = str(e)
+            self.event(f"Автоподбор не удался: {e}", "warn")
+        finally:
+            self.opt_state.update(running=False, progress="")
+
     # ------------------------------------------------------------ для страницы
     def stats(self):
         j = self.journal
@@ -434,7 +530,7 @@ class Bot:
             for sym, tr in self.trades.items():
                 px = self.price.get(sym) or tr["entry"]
                 d = 1 if tr["side"] == "Buy" else -1
-                risk_px = tr["entry"] * self.p.sl_pct / 100
+                risk_px = tr["entry"] * tr.get("sl_pct", self.p.sl_pct) / 100
                 r_now = (px - tr["entry"]) * d / risk_px if risk_px else 0
                 open_tr.append({**tr, "price": px, "r_now": r_now, "pnl_now": r_now * tr["risk_usd"]})
             return {
@@ -443,7 +539,10 @@ class Bot:
                 "params": self.p.as_dict(), "symbols": self.syms, "session": sess, "server_ms": now_ms(),
                 "control_key_required": bool(web.CONTROL_KEY),
                 "markets": {s: {"price": self.price.get(s), **self.lv[s], "check": self.check[s],
-                                "taken_today": self.taken.get((s, day), 0)} for s in self.syms},
+                                "taken_today": self.taken.get((s, day), 0), "params": self.ps[s].as_dict(),
+                                "enabled": self.enabled[s], "opt": self.opt[s]} for s in self.syms},
+                "opt_state": {**self.opt_state, "auto": self.a.auto_opt, "apply": self.a.auto_apply,
+                              "days": self.a.opt_days, "test": self.a.opt_test, "grid": st.GRID},
                 "trades": open_tr, "journal": self.journal[-100:][::-1], "stats": self.stats(),
                 "events": list(self.events)[:50],
             }
@@ -458,10 +557,11 @@ class Bot:
 
     def backtest(self, sym, days, balance, risk):
         days = max(5, min(60, int(days)))
-        key = (sym, days, round(balance, 2), round(risk, 3), st.ny_day(now_ms()).isoformat())
+        key = (sym, days, round(balance, 2), round(risk, 3), st.ny_day(now_ms()).isoformat(),
+               tuple(sorted(self.ps[sym].as_dict().items())))
         if key in self.bt_cache:
             return self.bt_cache[key]
-        p = st.Params(**{**self.p.as_dict(), "risk_pct": risk})
+        p = st.Params(**{**self.ps[sym].as_dict(), "risk_pct": risk})
         daily = klines(self.public, sym, "D", limit=days + 10)
         res = st.backtest(sym, daily, lambda d: self.minutes_for(sym, d), p, days=days, balance=balance)
         self.bt_cache[key] = res
@@ -494,6 +594,13 @@ def main():
     ap.add_argument("--chase-slip", type=int, default=5)
     ap.add_argument("--close-timeout", type=float, default=60)
     ap.add_argument("--poll", type=float, default=1)
+    ap.add_argument("--no-auto-opt", dest="auto_opt", action="store_false", help="не подбирать настройки каждый день")
+    ap.add_argument("--no-auto-apply", dest="auto_apply", action="store_false",
+                    help="подбирать, но не применять (только показывать на странице)")
+    ap.add_argument("--opt-days", type=int, default=60, help="дней истории для подбора")
+    ap.add_argument("--opt-test", type=int, default=20, help="последних дней на проверку (подбор их не видит)")
+    ap.add_argument("--opt-before", type=int, default=60, help="за сколько минут до окна NY подбирать")
+    ap.add_argument("--opt-min-trades", type=int, default=8, help="мин. сделок на днях подбора")
     ap.add_argument("--state-path", default=os.getenv("STATE_PATH") or ("/data/state.json" if os.path.isdir("/data") else "data/state.json"))
     argv = sys.argv[1:] or normalize_args(os.getenv("BOT_ARGS", ""), ap)
     a, unknown = ap.parse_known_args(argv)

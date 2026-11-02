@@ -26,7 +26,7 @@ UTC = timezone.utc
 class Params:
     sl_pct: float = 0.3          # стоп, % от входа
     tp_r: float = 3.0            # тейк в R
-    be_r: float = 2.0            # перенос в безубыток на +R
+    be_r: float = 2.0            # перенос в безубыток на +R (0 = без переноса)
     touch_pct: float = 0.12      # касание уровня, % от уровня
     strong_body: float = 0.5     # тело сигнальной свечи ≥ доля диапазона (0 = не проверять)
     risk_pct: float = 1.0        # риск на сделку, % баланса
@@ -118,7 +118,7 @@ def levels_for(side, entry, p):
         "risk": risk,
         "sl": entry - d * risk,
         "tp": entry + d * p.tp_r * risk,
-        "be_trigger": entry + d * p.be_r * risk,
+        "be_trigger": entry + d * p.be_r * risk if p.be_r > 0 else None,
         "be_stop": entry + d * fee_buf,
     }
 
@@ -128,14 +128,16 @@ def fee_r(p):
     return 2 * p.fee_pct / p.sl_pct
 
 
-def simulate(side, entry, candles, p):
-    """Прогон сделки по свечам после входа. Если в одной свече задеты и стоп, и тейк —
+def simulate(side, entry, candles, p, start=0):
+    """Прогон сделки по свечам candles[start:]. Если в одной свече задеты и стоп, и тейк —
     считаем, что первым был стоп (консервативно)."""
     lv = levels_for(side, entry, p)
     d = 1 if side == "Buy" else -1
     stop, be = lv["sl"], False
+    trig = lv["be_trigger"]
     exit_px, outcome, exit_t = None, "OPEN", None
-    for c in candles:
+    for k in range(start, len(candles)):
+        c = candles[k]
         lo, hi = c["l"], c["h"]
         hit_stop = lo <= stop if d > 0 else hi >= stop
         hit_tp = hi >= lv["tp"] if d > 0 else lo <= lv["tp"]
@@ -145,11 +147,12 @@ def simulate(side, entry, candles, p):
         if hit_tp:
             exit_px, outcome, exit_t = lv["tp"], "TP", c["t"]
             break
-        if not be and (hi >= lv["be_trigger"] if d > 0 else lo <= lv["be_trigger"]):
+        if trig is not None and not be and (hi >= trig if d > 0 else lo <= trig):
             be, stop = True, lv["be_stop"]
     if exit_px is None:
-        exit_px = candles[-1]["c"] if candles else entry
-        exit_t = candles[-1]["t"] if candles else None
+        last = candles[-1] if len(candles) > start else None
+        exit_px = last["c"] if last else entry
+        exit_t = last["t"] if last else None
     gross_r = (exit_px - entry) * d / lv["risk"]
     return {**lv, "side": side, "entry": entry, "exit": exit_px, "outcome": outcome, "exit_t": exit_t,
             "be_moved": be, "r_gross": gross_r, "r": gross_r - fee_r(p)}
@@ -190,7 +193,7 @@ def backtest(symbol, daily, minutes_for_day, p, days=30, balance=10000.0, now_ms
             if not side:
                 i += 1
                 continue
-            res = simulate(side, c["c"], mins[i + 1:], p)
+            res = simulate(side, c["c"], mins, p, start=i + 1)
             risk_usd = balance * p.risk_pct / 100
             pnl = res["r"] * risk_usd
             balance += pnl
@@ -227,4 +230,134 @@ def backtest(symbol, daily, minutes_for_day, p, days=30, balance=10000.0, now_ms
             "max_dd": max_dd, "max_wins": streak_w, "max_losses": streak_l,
             "fee_r": fee_r(p), "avg_r": sum(t["r"] for t in trades) / len(trades) if trades else 0,
         },
+    }
+
+
+# ---------------------------------------------------------------- автоподбор настроек (walk-forward)
+
+# Какие настройки перебираем. Сигнал зависит от touch/strong/окна, выход — от sl/tp/be.
+GRID = {
+    "sl_pct": [0.2, 0.3, 0.5, 0.8],
+    "tp_r": [1.5, 2.0, 3.0],
+    "be_r": [1.0, 2.0, 0.0],
+    "touch_pct": [0.08, 0.15, 0.3],
+    "strong_body": [0.0, 0.5],
+    "session_min": [30, 60, 90],
+}
+
+
+def collect_days(daily, minutes_for_day, days, now_ms, session_start="09:30", progress=None):
+    """Будние дни за последние `days` дней: уровни вчерашнего дня и 1m свечи от окна до конца суток."""
+    by_day = {c["t"]: c for c in daily}
+    today = ny_day(now_ms)
+    out = []
+    ks = list(range(days, 0, -1))
+    for n, k in enumerate(ks):
+        d = today - timedelta(days=k)
+        if progress:
+            progress(n + 1, len(ks))
+        if d.weekday() >= 5:
+            continue
+        s_ms, _ = session_bounds(d, Params(session_start=session_start, session_min=60))
+        prev = by_day.get(utc_day_start(s_ms) - 86_400_000)
+        if not prev:
+            continue
+        mins = minutes_for_day(d)
+        if mins:
+            out.append({"d": d, "s_ms": s_ms, "pdh": prev["h"], "pdl": prev["l"], "mins": mins})
+    return out
+
+
+def first_signal(day, p):
+    """Первый сигнал дня в окне: (индекс свечи, сторона) или None."""
+    end = day["s_ms"] + p.session_min * 60_000
+    for i, c in enumerate(day["mins"]):
+        if c["t"] < day["s_ms"]:
+            continue
+        if c["t"] + 60_000 > end:
+            break
+        side = signal(c, day["pdh"], day["pdl"], p)
+        if side:
+            return i, side
+    return None
+
+
+def r_stats(rs):
+    """Статистика по списку результатов сделок в R."""
+    if not rs:
+        return {"n": 0, "sum_r": 0.0, "avg_r": 0.0, "winrate": 0.0, "pf": 0.0, "max_dd_r": 0.0}
+    gp = sum(r for r in rs if r > 0)
+    gl = -sum(r for r in rs if r < 0)
+    eq = peak = dd = 0.0
+    for r in rs:
+        eq += r
+        peak = max(peak, eq)
+        dd = max(dd, peak - eq)
+    return {"n": len(rs), "sum_r": sum(rs), "avg_r": sum(rs) / len(rs),
+            "winrate": sum(r > 0 for r in rs) / len(rs) * 100,
+            "pf": gp / gl if gl else (99.9 if gp else 0.0), "max_dd_r": dd}
+
+
+def optimize(days_data, base, test_days=20, grid=None, min_train=8, min_test=3, now_ms=None, progress=None):
+    """Подбор на старых днях (train), проверка на последних test_days днях (test), которых подбор не видел.
+
+    Настройки применяются, только если на проверке результат > 0 R и сделок хватает.
+    """
+    grid = grid or GRID
+    now_ms = now_ms or int(datetime.now(UTC).timestamp() * 1000)
+    cut = ny_day(now_ms) - timedelta(days=test_days)
+    train = [x for x in days_data if x["d"] <= cut]
+    test = [x for x in days_data if x["d"] > cut]
+    sig_keys = [(t, sb, sm) for t in grid["touch_pct"] for sb in grid["strong_body"] for sm in grid["session_min"]]
+    exit_keys = [(sl, tp, be) for sl in grid["sl_pct"] for tp in grid["tp_r"] for be in grid["be_r"]]
+    total = len(sig_keys) * len(exit_keys)
+    rows = []
+    done = 0
+    for (t, sb, sm) in sig_keys:
+        ps = Params(**{**base.as_dict(), "touch_pct": t, "strong_body": sb, "session_min": sm, "trades_per_day": 1})
+        sigs_train = [(x, first_signal(x, ps)) for x in train]
+        sigs_test = [(x, first_signal(x, ps)) for x in test]
+        for (sl, tp, be) in exit_keys:
+            p = Params(**{**ps.as_dict(), "sl_pct": sl, "tp_r": tp, "be_r": be})
+
+            def run(sigs):
+                out = []
+                for x, sg in sigs:
+                    if sg:
+                        i, side = sg
+                        out.append(simulate(side, x["mins"][i]["c"], x["mins"], p, start=i + 1)["r"])
+                return out
+            rows.append({"params": p.as_dict(), "train": r_stats(run(sigs_train)), "test": r_stats(run(sigs_test))})
+            done += 1
+            if progress and done % 50 == 0:
+                progress(done, total)
+    ok = [r for r in rows if r["train"]["n"] >= min_train and r["train"]["pf"] >= 1.1]
+    ok.sort(key=lambda r: (r["train"]["sum_r"], r["train"]["pf"]), reverse=True)
+    base_row = next((r for r in rows if all(r["params"][k] == base.as_dict()[k] for k in GRID)), None)
+    if base_row is None:
+        def run_base(xs):
+            out = []
+            for x in xs:
+                sg = first_signal(x, base)
+                if sg:
+                    out.append(simulate(sg[1], x["mins"][sg[0]]["c"], x["mins"], base, start=sg[0] + 1)["r"])
+            return out
+        base_row = {"params": base.as_dict(), "train": r_stats(run_base(train)), "test": r_stats(run_base(test))}
+    best = ok[0] if ok else None
+    if not best:
+        applied, reason = False, (f"На {len(train)} днях подбора нет настроек с ≥{min_train} сделками и PF ≥ 1.1 — "
+                                  "монету не торгую")
+    elif best["test"]["n"] < min_test:
+        applied, reason = False, f"На проверке ({len(test)} дней) всего {best['test']['n']} сделок — мало, не торгую"
+    elif best["test"]["sum_r"] <= 0:
+        applied, reason = False, (f"Лучшие настройки подбора на проверке в минусе ({best['test']['sum_r']:+.1f}R) — "
+                                  "похоже на подгонку, не торгую")
+    else:
+        applied, reason = True, (f"Подбор {best['train']['sum_r']:+.1f}R за {best['train']['n']} сделок, "
+                                 f"проверка {best['test']['sum_r']:+.1f}R за {best['test']['n']} — применяю")
+    return {
+        "applied": applied, "reason": reason, "best": best, "baseline": base_row,
+        "top": ok[:10], "tested": total, "passed_train": len(ok),
+        "train_days": len(train), "test_days": len(test),
+        "train_from": train[0]["d"].isoformat() if train else None, "test_from": test[0]["d"].isoformat() if test else None,
     }

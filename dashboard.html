@@ -49,6 +49,9 @@ tailwind.config = { darkMode: 'class', theme: { extend: {
     <button onclick="switchTab('backtest')" id="tab-btn-bt" class="px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition text-gray-400 hover:text-white">
       <i class="fa-solid fa-clock-rotate-left text-amber-400"></i> БЕКТЕСТ
     </button>
+    <button onclick="switchTab('opt')" id="tab-btn-opt" class="px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition text-gray-400 hover:text-white">
+      <i class="fa-solid fa-wand-magic-sparkles text-violet-400"></i> ОПТИМІЗАЦІЯ
+    </button>
   </div>
 
   <div class="flex items-center gap-3 flex-wrap">
@@ -291,6 +294,39 @@ tailwind.config = { darkMode: 'class', theme: { extend: {
   </div>
 </div>
 
+<!-- ================= ОПТИМІЗАЦІЯ ================= -->
+<div id="view-opt" class="hidden flex-1 p-4 max-w-[1500px] mx-auto w-full flex flex-col gap-4">
+  <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-wrap items-start justify-between gap-4">
+    <div class="min-w-0 max-w-3xl">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2 mb-2"><i class="fa-solid fa-wand-magic-sparkles text-violet-400"></i> Автопідбір налаштувань (walk-forward)</h2>
+      <p class="text-xs text-gray-400 leading-relaxed" id="opt-explain"></p>
+    </div>
+    <div class="flex flex-col items-end gap-2">
+      <button onclick="control('optimize')" id="btn-opt" class="px-4 py-2.5 bg-violet-600 hover:bg-violet-500 text-white font-bold rounded-lg text-xs disabled:opacity-40">
+        <i class="fa-solid fa-rotate"></i> ПІДІБРАТИ ЗАРАЗ
+      </button>
+      <span id="opt-status" class="text-[11px] font-mono text-gray-400 text-right"></span>
+    </div>
+  </div>
+  <div id="opt-cards" class="grid grid-cols-1 lg:grid-cols-3 gap-4"></div>
+  <div class="bg-dark-card border border-dark-border rounded-xl p-4">
+    <div class="flex items-center justify-between flex-wrap gap-2 border-b border-dark-border pb-2 mb-3">
+      <h3 class="text-xs font-bold text-white uppercase tracking-wider"><i class="fa-solid fa-ranking-star text-violet-400"></i> Топ-10 варіантів на днях підбору</h3>
+      <select id="opt-sym" onchange="renderOpt()" class="bg-dark-bg border border-dark-border rounded-lg px-2 py-1 text-white text-xs"></select>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs font-mono min-w-[760px]">
+        <thead><tr class="text-gray-500 text-[11px] border-b border-dark-border text-right">
+          <th class="py-1 text-left font-sans">#</th><th class="font-sans">Стоп</th><th class="font-sans">Тейк</th><th class="font-sans">Б/У</th><th class="font-sans">Дотик</th><th class="font-sans">Тіло</th><th class="font-sans">Вікно</th>
+          <th class="font-sans">Підбір R</th><th class="font-sans">угод</th><th class="font-sans">PF</th><th class="font-sans">Перевірка R</th><th class="font-sans">угод</th>
+        </tr></thead>
+        <tbody id="opt-top"></tbody>
+      </table>
+    </div>
+    <p class="text-[11px] text-gray-500 mt-2">Відбір — тільки за днями підбору. Стовпці «Перевірка» показують, як ті самі налаштування відпрацювали на днях, яких підбір не бачив.</p>
+  </div>
+</div>
+
 <div id="toast" class="toast fixed left-1/2 -translate-x-1/2 bottom-5 bg-white text-black text-sm font-semibold px-4 py-2 rounded-lg opacity-0 pointer-events-none z-[60]"></div>
 
 <footer class="border-t border-dark-border bg-dark-card px-4 py-2.5 text-center text-xs text-gray-500">
@@ -360,6 +396,7 @@ async function poll() {
     $('conn-text').textContent = 'Бот онлайн';
     if (!currentSymbol) initSymbols();
     render();
+    if (currentTab === 'opt') renderOpt();
   } catch (e) {
     $('conn-dot').className = 'h-2 w-2 rounded-full bg-red-500';
     $('conn-text').textContent = 'Немає зв’язку з ботом';
@@ -368,6 +405,7 @@ async function poll() {
 function initSymbols() {
   $('sym-buttons').innerHTML = S.symbols.map(s => `<button data-sym="${s}" onclick="changeSymbol('${s}')" class="px-3 py-1.5 rounded-md">${short(s)}/USDT</button>`).join('');
   $('bt-asset').innerHTML = S.symbols.map(s => `<option value="${s}">${short(s)}/USDT</option>`).join('');
+  $('opt-sym').innerHTML = $('bt-asset').innerHTML;
   $('bt-risk').value = S.params.risk_pct;
   changeSymbol(S.symbols[0]);
   changeTf('1');
@@ -377,7 +415,7 @@ function check(ok, title, sub) {
     <div><span class="font-semibold text-white block">${title}</span><span class="text-gray-400 text-[11px]">${sub}</span></div></div>`;
 }
 function render() {
-  const p = S.params, m = S.markets[currentSymbol] || {}, sess = S.session;
+  const m = S.markets[currentSymbol] || {}, p = m.params || S.params, sess = S.session;
   const live = S.mode.startsWith('РЕАЛ');
   $('mode-badge').textContent = S.mode + (S.dry ? ' • DRY' : '');
   $('mode-badge').className = 'text-[10px] font-semibold px-2 py-0.5 rounded border uppercase tracking-wider ' + (live ? 'bg-red-500/20 text-red-300 border-red-500/30' : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30');
@@ -388,8 +426,8 @@ function render() {
 
   // автопілот
   const st = $('auto-state');
-  st.textContent = S.paused ? 'ПАУЗА' : 'ТОРГУЄ';
-  st.className = 'text-[11px] font-bold px-2 py-0.5 rounded ' + (S.paused ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400');
+  st.textContent = S.paused ? 'ПАУЗА' : (m.enabled === false ? short(currentSymbol) + ' ВИМКНЕНО' : 'ТОРГУЄ');
+  st.className = 'text-[11px] font-bold px-2 py-0.5 rounded ' + (S.paused || m.enabled === false ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400');
   $('btn-start').disabled = !S.paused; $('btn-pause').disabled = S.paused;
   const hms = s => `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor(s % 3600 / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
   $('session-line').innerHTML = sess.active
@@ -401,7 +439,7 @@ function render() {
   $('r-balance').textContent = '$' + fmt(S.balance, 2);
   $('r-risk').textContent = `−$${risk.toFixed(2)} (${p.risk_pct}%)`;
   $('r-sl').textContent = `${p.sl_pct}% від входу`;
-  $('r-rr').textContent = `+${p.be_r}R / +${p.tp_r}R`;
+  $('r-rr').textContent = `${p.be_r > 0 ? '+' + p.be_r + 'R' : 'без Б/У'} / +${p.tp_r}R`;
   const qty = m.price ? risk / (m.price * p.sl_pct / 100) : 0;
   $('r-qty').textContent = m.price ? `${fmt(qty, 3)} ${short(currentSymbol)} ≈ $${fmt(qty * m.price, 0)}` : '—';
   $('r-fee').textContent = `≈ ${(2 * p.fee_pct / p.sl_pct).toFixed(2)}R`;
@@ -421,7 +459,8 @@ function render() {
     check(!!it, side ? `Пробій ${side === 'long' ? 'PDH' : 'PDL'}` : 'Пробій PDH або PDL', 'Закриття за вчорашнім рівнем') +
     check(it && it.retest, 'Ретест рівня', `Тінь торкнулась рівня (±${p.touch_pct}%)`) +
     check(it && it.strong, 'Сильна сигнальна свічка', `Тіло ≥ ${Math.round(p.strong_body * 100)}% діапазону, у бік пробою`) +
-    check(m.taken_today < p.trades_per_day, `Ліміт угод: ${m.taken_today}/${p.trades_per_day} сьогодні`, 'Не більше однієї угоди на монету в день');
+    check(m.taken_today < p.trades_per_day, `Ліміт угод: ${m.taken_today}/${p.trades_per_day} сьогодні`, 'Не більше однієї угоди на монету в день') +
+    check(m.enabled !== false, m.enabled === false ? 'Монета вимкнена автопідбором' : 'Налаштування пройшли перевірку', m.opt ? escapeHtml(m.opt.reason) : 'Автопідбір ще не запускався');
 
   // сканер
   const sig = S.events.find(e => e.kind === 'signal' || e.kind === 'trade');
@@ -440,11 +479,11 @@ function render() {
     $('pos-badge').textContent = isL ? 'LONG' : 'SHORT';
     $('pos-badge').className = 'px-2 py-0.5 rounded font-bold uppercase text-white ' + (isL ? 'bg-emerald-600' : 'bg-bearish');
     $('pos-entry').textContent = fmt(tr.entry); $('pos-sl').textContent = fmt(tr.stop) + (tr.be ? ' (Б/У)' : '');
-    $('pos-be').textContent = fmt(tr.be_trigger); $('pos-tp').textContent = fmt(tr.tp);
+    $('pos-be').textContent = tr.be_trigger == null ? 'вимкн.' : fmt(tr.be_trigger); $('pos-tp').textContent = fmt(tr.tp);
     $('pos-pnl').textContent = `${money(tr.pnl_now)} (${tr.r_now.toFixed(2)}R)`;
     $('pos-pnl').className = 'font-mono font-bold ml-1 ' + (tr.pnl_now >= 0 ? 'text-emerald-400' : 'text-bearish');
     setLine('entry', tr.entry, '#3b82f6', 'ВХІД'); setLine('sl', tr.stop, tr.be ? '#f59e0b' : '#FF5252', tr.be ? 'СТОП Б/У' : 'SL');
-    setLine('tp', tr.tp, '#00E676', 'TP 3R'); setLine('be', tr.be ? null : tr.be_trigger, '#f59e0b', '→ Б/У', LightweightCharts.LineStyle.Dotted);
+    setLine('tp', tr.tp, '#00E676', `TP ${tr.tp_r || 3}R`); setLine('be', tr.be ? null : tr.be_trigger, '#f59e0b', '→ Б/У', LightweightCharts.LineStyle.Dotted);
   } else ['entry', 'sl', 'tp', 'be'].forEach(k => setLine(k, null));
 
   // маркери угод
@@ -466,13 +505,15 @@ function render() {
       <td class="py-2 text-right font-mono font-bold ${c}">${money(t.pnl)}</td></tr>`;
   }).join('') : '<tr><td colspan="4" class="py-8 text-center text-gray-500 italic">Угод ще не було.</td></tr>';
 
-  $('rules').innerHTML = `• Вхід тільки у вікно ${sess.window_kyiv} за Києвом (9:30–10:30 NY), будні.<br>
-    • Пробій + ретест PDH/PDL, сильна свічка, ${p.trades_per_day} угода на монету в день.<br>
-    • Стоп ${p.sl_pct}%, ризик ${p.risk_pct}% балансу. На +${p.be_r}R стоп у Б/У, тейк +${p.tp_r}R.<br>
+  $('rules').innerHTML = `• ${short(currentSymbol)}: вікно ${p.session_min} хв від 16:30 за Києвом (9:30 NY), будні.<br>
+    • Пробій + ретест PDH/PDL (дотик ${p.touch_pct}%), тіло свічки ≥ ${Math.round(p.strong_body * 100)}%, ${p.trades_per_day} угода на монету в день.<br>
+    • Стоп ${p.sl_pct}%, ризик ${p.risk_pct}% балансу. ${p.be_r > 0 ? 'На +' + p.be_r + 'R стоп у Б/У, ' : 'Без Б/У, '}тейк +${p.tp_r}R.<br>
+    • Налаштування підбираються щодня автоматично (вкладка «Оптимізація»).<br>
     • Тільки лімітки: вхід і вихід з догоном, на біржі стоїть тейк і стоп-ліміт.<br>
     • Комісії ≈ ${(2 * p.fee_pct / p.sl_pct).toFixed(2)}R на угоду — вже враховані в бектесті.`;
   $('bt-params').innerHTML = `<div class="flex justify-between text-gray-400"><span>Сигнал:</span><span class="text-white font-semibold">PDH/PDL пробій + ретест</span></div>
-    <div class="flex justify-between text-gray-400"><span>Стоп / Б/У / Тейк:</span><span class="text-emerald-400 font-bold">${p.sl_pct}% / +${p.be_r}R / +${p.tp_r}R</span></div>
+    <div class="flex justify-between text-gray-400"><span>Стоп / Б/У / Тейк:</span><span class="text-emerald-400 font-bold">${p.sl_pct}% / ${p.be_r > 0 ? '+' + p.be_r + 'R' : '—'} / +${p.tp_r}R</span></div>
+    <div class="flex justify-between text-gray-400"><span>Дотик / тіло / вікно:</span><span class="text-white">${p.touch_pct}% / ${p.strong_body} / ${p.session_min} хв</span></div>
     <div class="flex justify-between text-gray-400"><span>Комісія:</span><span class="text-amber-400 font-bold">${p.fee_pct}% × 2 ≈ ${(2 * p.fee_pct / p.sl_pct).toFixed(2)}R</span></div>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
@@ -485,7 +526,7 @@ async function control(action, symbol) {
     const r = await fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, symbol, key }) });
     const d = await r.json();
     if (!r.ok) { toast(d.error || 'Помилка'); if (r.status === 403) $('key-row').classList.remove('hidden'); return; }
-    toast({ start: 'Автопілот запущено', pause: 'Пауза: нові входи вимкнені', close: 'Закриваю лімітками…', close_all: 'Закриваю все лімітками…' }[action]);
+    toast({ optimize: 'Запускаю підбір налаштувань…', start: 'Автопілот запущено', pause: 'Пауза: нові входи вимкнені', close: 'Закриваю лімітками…', close_all: 'Закриваю все лімітками…' }[action]);
     setTimeout(poll, 600);
   } catch (e) { toast('Немає зв’язку з ботом'); }
 }
@@ -493,12 +534,18 @@ function askCloseAll() { $('confirm-close-all').classList.remove('hidden'); }
 function hideCloseAll() { $('confirm-close-all').classList.add('hidden'); }
 
 // ---------- вкладки
+let currentTab = 'live';
 function switchTab(tab) {
-  const live = tab === 'live';
-  $('view-live').classList.toggle('hidden', !live); $('view-backtest').classList.toggle('hidden', live);
-  $('tab-btn-live').className = 'px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition ' + (live ? 'bg-brand-600 text-white' : 'text-gray-400 hover:text-white');
-  $('tab-btn-bt').className = 'px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition ' + (!live ? 'bg-amber-500 text-black' : 'text-gray-400 hover:text-white');
-  if (!live && !btChart) { [btChart, btSeries] = makeChart($('bt-chart')); initEquity(); }
+  currentTab = tab;
+  const base = 'px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition ';
+  $('view-live').classList.toggle('hidden', tab !== 'live');
+  $('view-backtest').classList.toggle('hidden', tab !== 'backtest');
+  $('view-opt').classList.toggle('hidden', tab !== 'opt');
+  $('tab-btn-live').className = base + (tab === 'live' ? 'bg-brand-600 text-white' : 'text-gray-400 hover:text-white');
+  $('tab-btn-bt').className = base + (tab === 'backtest' ? 'bg-amber-500 text-black' : 'text-gray-400 hover:text-white');
+  $('tab-btn-opt').className = base + (tab === 'opt' ? 'bg-violet-600 text-white' : 'text-gray-400 hover:text-white');
+  if (tab === 'backtest' && !btChart) { [btChart, btSeries] = makeChart($('bt-chart')); initEquity(); }
+  if (tab === 'opt' && S) renderOpt();
 }
 
 // ---------- бектест
@@ -552,7 +599,7 @@ function showBt(i) {
   btSeries.setData(t.candles.map(toBar));
   const L = (price, color, title, style) => btLines.push(btSeries.createPriceLine({ price, color, lineWidth: 1, lineStyle: style ?? 0, title }));
   L(t.side === 'Buy' ? t.pdh : t.pdl, '#3b82f6', t.side === 'Buy' ? 'PDH' : 'PDL', 2);
-  L(t.entry, '#e2e8f0', 'ВХІД'); L(t.sl, '#FF5252', 'SL'); L(t.tp, '#00E676', 'TP'); L(t.be_trigger, '#f59e0b', 'Б/У', 1);
+  L(t.entry, '#e2e8f0', 'ВХІД'); L(t.sl, '#FF5252', 'SL'); L(t.tp, '#00E676', 'TP'); if (t.be_trigger != null) L(t.be_trigger, '#f59e0b', 'Б/У', 1);
   const mk = [{ time: Math.floor(t.t / 1000), position: t.side === 'Buy' ? 'belowBar' : 'aboveBar', color: '#3b82f6', shape: t.side === 'Buy' ? 'arrowUp' : 'arrowDown', text: 'ВХІД' }];
   if (t.exit_t) mk.push({ time: Math.floor(t.exit_t / 1000), position: 'aboveBar', color: t.r > 0 ? '#00E676' : '#FF5252', shape: 'circle', text: t.outcome });
   btSeries.setMarkers(mk.sort((a, b) => a.time - b.time));
@@ -565,6 +612,54 @@ function toggleReplay() {
   if (!bt || !bt.trades.length) return;
   b.innerHTML = '<i class="fa-solid fa-pause"></i> ПАУЗА';
   replayTimer = setInterval(() => { if (btIndex < bt.trades.length - 1) showBt(btIndex + 1); else toggleReplay(); }, 1500);
+}
+
+// ---------- оптимізація
+function statBox(label, st, cls) {
+  if (!st) return '';
+  const c = st.sum_r > 0 ? 'text-emerald-400' : st.sum_r < 0 ? 'text-bearish' : 'text-gray-300';
+  return `<div class="bg-dark-bg border border-dark-border rounded-lg p-2.5"><span class="text-[10px] uppercase text-gray-500 block">${label}</span>
+    <span class="font-mono font-bold text-base ${c}">${st.sum_r >= 0 ? '+' : ''}${st.sum_r.toFixed(1)}R</span>
+    <span class="font-mono text-[11px] text-gray-400 block">${st.n} угод • WR ${st.winrate.toFixed(0)}% • PF ${st.pf.toFixed(2)}</span></div>`;
+}
+const pTxt = p => `стоп ${p.sl_pct}% • тейк ${p.tp_r}R • ${p.be_r > 0 ? 'Б/У +' + p.be_r + 'R' : 'без Б/У'} • дотик ${p.touch_pct}% • тіло ${p.strong_body} • вікно ${p.session_min} хв`;
+function renderOpt() {
+  const o = S.opt_state;
+  $('opt-explain').innerHTML = `Бот перебирає <b class="text-white">${(() => { const g = o.grid; return Object.values(g).reduce((a, v) => a * v.length, 1); })()}</b> варіантів налаштувань на старих днях
+    (${o.days - o.test} дн.), бере найкращий і перевіряє його на останніх <b class="text-white">${o.test}</b> днях, яких підбір не бачив.
+    Налаштування застосовуються, лише якщо перевірка теж у плюсі; інакше монета вимикається до наступного підбору.
+    ${o.auto ? 'Підбір запускається сам щодня за годину до вікна NY.' : 'Автопідбір вимкнений (--no-auto-opt).'}
+    ${o.apply ? '' : '<b class="text-amber-400">Режим тільки показу: налаштування не застосовуються (--no-auto-apply).</b>'}`;
+  $('btn-opt').disabled = o.running;
+  $('opt-status').textContent = o.running ? 'Йде підбір: ' + o.progress
+    : (o.last_run ? 'Останній підбір: ' + new Date(o.last_run).toLocaleString('uk-UA') : 'Підбір ще не запускався') + (o.error ? ' • помилка: ' + o.error : '');
+  $('opt-cards').innerHTML = S.symbols.map(sym => {
+    const m = S.markets[sym], r = m.opt;
+    const pill = m.enabled ? '<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[11px] font-bold">ТОРГУЄ</span>'
+                           : '<span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[11px] font-bold">НЕ ТОРГУЄ</span>';
+    if (!r) return `<div class="bg-dark-card border border-dark-border rounded-xl p-4"><div class="flex justify-between items-center mb-2"><b class="text-white">${short(sym)}/USDT</b>${pill}</div>
+      <p class="text-xs text-gray-400">Підбір ще не запускався.</p></div>`;
+    const b = r.best;
+    return `<div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
+      <div class="flex justify-between items-center"><b class="text-white text-sm">${short(sym)}/USDT</b>${pill}</div>
+      <p class="text-xs ${r.applied ? 'text-emerald-300' : 'text-amber-300'}">${escapeHtml(r.reason)}</p>
+      <div class="text-[11px] text-gray-400"><span class="text-gray-500">Діють зараз:</span><br><span class="text-white font-mono">${pTxt(m.params)}</span></div>
+      ${b ? `<div class="text-[11px] text-gray-400"><span class="text-gray-500">Найкращі на підборі:</span><br><span class="font-mono">${pTxt(b.params)}</span></div>
+      <div class="grid grid-cols-2 gap-2">${statBox('Підбір (' + r.train_days + ' дн.)', b.train)}${statBox('Перевірка (' + r.test_days + ' дн.)', b.test)}</div>` : ''}
+      <div class="text-[11px] text-gray-500">Для порівняння, стандартні налаштування з файлу:</div>
+      <div class="grid grid-cols-2 gap-2">${statBox('Підбір', r.baseline.train)}${statBox('Перевірка', r.baseline.test)}</div>
+      <div class="text-[10px] text-gray-500 font-mono">Перевірено ${r.tested} варіантів, пройшли фільтр підбору: ${r.passed_train}</div>
+    </div>`;
+  }).join('');
+  const r = (S.markets[$('opt-sym').value] || {}).opt;
+  const top = r ? r.top : [];
+  $('opt-top').innerHTML = top.length ? top.map((x, i) => {
+    const p = x.params, cls = v => v > 0 ? 'text-emerald-400' : v < 0 ? 'text-bearish' : '';
+    return `<tr class="border-b border-dark-border/40 text-right ${i === 0 ? 'bg-violet-500/5' : ''}"><td class="py-1.5 text-left">${i + 1}</td><td>${p.sl_pct}%</td><td>${p.tp_r}R</td><td>${p.be_r > 0 ? p.be_r + 'R' : '—'}</td>
+      <td>${p.touch_pct}%</td><td>${p.strong_body}</td><td>${p.session_min}</td>
+      <td class="${cls(x.train.sum_r)}">${x.train.sum_r.toFixed(1)}</td><td>${x.train.n}</td><td>${x.train.pf.toFixed(2)}</td>
+      <td class="${cls(x.test.sum_r)}">${x.test.sum_r.toFixed(1)}</td><td>${x.test.n}</td></tr>`;
+  }).join('') : '<tr><td colspan="12" class="py-6 text-center text-gray-500 font-sans">Немає варіантів, що пройшли фільтр підбору.</td></tr>';
 }
 
 // ---------- старт
