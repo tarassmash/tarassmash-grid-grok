@@ -16,7 +16,8 @@
 | `BOT_ARGS` | параметры бота, например `--budget 30 --leverage 3 --tp-usdt 1` |
 | `HTTPS_PROXY` | (если Bybit блокирует IP Railway) `socks5://user:pass@host:port` или `http://…` |
 
-4. Открой **Deployments → View logs**. В начале должно быть `Ключи OK, баланс USDT: …`.
+4. **Settings → Networking → Generate Domain**: появится ссылка на страницу бота
+   (состояние, баланс, текущая сетка, скан, закрытые сетки, лог). Ошибки настройки тоже видны там.
 
 Бот сразу торгует на **реальном счёте**. Для учебного счёта добавь `--testnet` в `BOT_ARGS`
 (или переменную `BYBIT_ENV=testnet`) и ключи с testnet.bybit.com.

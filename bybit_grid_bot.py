@@ -45,6 +45,8 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from pybit.unified_trading import HTTP
 
+import status_web as web
+
 log = logging.getLogger("grid")
 CAT = "linear"
 
@@ -167,6 +169,8 @@ def scan(s, inst, a):
            and r["vol1m"] >= a.min_1m]
     res.sort(key=lambda r: r["score"], reverse=True)
     log.info("Скан: %d пар по объёму, %d прошли фильтры", len(syms), len(res))
+    web.update(scan={"time": time.time(), "checked": len(syms), "passed": len(res),
+                     "top": [{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")} for r in res[:10]]})
     for r in res[:5]:
         log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f score=%.2f",
                  r["symbol"], r["vol1m"], r["atr"], r["er"], r["score"])
@@ -199,6 +203,13 @@ class Grid:
         self.fills = 0
         self.t0 = time.time()
 
+    def publish(self, open_orders=None):
+        web.update(grid={
+            "symbol": self.sym, "lower": self.lower, "upper": self.upper, "levels": len(self.levels) - 1,
+            "step_pct": float(self.step_price) / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
+            "open_orders": len(self.orders) if open_orders is None else open_orders,
+            "fills": self.fills, "profit": self.realized_est, "started": self.t0})
+
     # --- orders
     def place(self, i, side, is_pair):
         price = self.levels[i]
@@ -227,6 +238,7 @@ class Grid:
         for i, side in plan:
             self.place(i, side, is_pair=False)
         log.info("%s: поставлено %d ордеров", self.sym, len(self.orders))
+        self.publish()
 
     def order_status(self, oid):
         r = api(self.s.get_order_history, category=CAT, symbol=self.sym, orderId=oid)
@@ -255,6 +267,7 @@ class Grid:
             elif st in ("Cancelled", "Rejected", "Deactivated"):
                 log.warning("%s: ордер %s @ %s %s, ставлю заново", self.sym, side, self.levels[i], st)
                 self.place(i, side, is_pair)
+        self.publish(len(self.orders))
 
     def unrealised(self):
         r = api(self.s.get_positions, category=CAT, symbol=self.sym)
@@ -288,6 +301,11 @@ class Grid:
                     qty=p["size"], reduceOnly=True, positionIdx=int(p.get("positionIdx", 0)))
                 log.info("%s: позиция %s %s закрыта по рынку", self.sym, p["side"], p["size"])
         log.info("%s: итог по оценке: сделок %d, сеточная прибыль≈%.3f$", self.sym, self.fills, self.realized_est)
+        with web.LOCK:
+            web.STATUS["history"].append({"time": time.strftime("%d.%m %H:%M UTC", time.gmtime()), "symbol": self.sym,
+                                          "fills": self.fills, "profit": self.realized_est, "reason": reason})
+            web.STATUS["history"] = web.STATUS["history"][-100:]
+            web.STATUS["grid"] = None
 
     def has_position(self):
         """Есть ли уже позиция или ордера на этой монете (например, от другого бота на счёте)."""
@@ -318,22 +336,37 @@ def normalize_args(text, parser):
 
 
 def check_access(s, a):
-    """Проверка, что Bybit доступен с этого сервера и ключи рабочие."""
+    """Проверка, что Bybit доступен с этого сервера и ключи рабочие. Возвращает текст ошибки или ''."""
     try:
         s.get_server_time()
     except Exception as e:  # noqa: BLE001
-        sys.exit("Bybit недоступен с этого сервера: %s\n"
-                 "Скорее всего IP облака заблокирован Bybit (403). Задай переменную HTTPS_PROXY "
-                 "(http:// или socks5:// прокси в разрешённой стране) или смени регион/хостинг." % e)
+        return ("Bybit недоступен с этого сервера: %s\n"
+                "Скорее всего IP облака заблокирован Bybit (403). Задай переменную HTTPS_PROXY "
+                "(http:// или socks5:// прокси в разрешённой стране) или смени регион Railway." % e)
     if a.dry:
-        return
+        return ""
     try:
-        r = s.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-        coins = r["result"]["list"][0]["coin"]
-        bal = next((c.get("walletBalance") for c in coins if c["coin"] == "USDT"), "0")
+        bal = balance(s)
         log.info("Ключи OK, баланс USDT: %s", bal)
     except Exception as e:  # noqa: BLE001
-        sys.exit("Ключи не работают: %s (проверь ключ, права Contract trade, привязку IP, testnet/mainnet)" % e)
+        return "Ключи не работают: %s (проверь ключ, права Contract trade, привязку IP, testnet/mainnet)" % e
+    return ""
+
+
+def balance(s):
+    r = s.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+    coins = r["result"]["list"][0]["coin"]
+    bal = float(next((c.get("walletBalance") for c in coins if c["coin"] == "USDT"), 0) or 0)
+    web.update(balance=bal)
+    return bal
+
+
+def wait_forever(msg):
+    """Фатальная ошибка: не выходим (иначе пропадёт страница), показываем её и ждём."""
+    log.error(msg)
+    web.update(error=msg, state="остановлен — нужна правка настроек")
+    while True:
+        time.sleep(3600)
 
 
 def main():
@@ -363,20 +396,24 @@ def main():
     #   BOT_ARGS=--budget 30 --leverage 3 --tp-usdt 1
     argv = sys.argv[1:] or normalize_args(os.getenv("BOT_ARGS", ""), p)
     a, unknown = p.parse_known_args(argv)
-    if unknown:
-        print("BOT_ARGS: не понял и пропускаю: " + " ".join(unknown), flush=True)
     a.max_levels = max(2, min(40, a.max_levels))
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S",
                         stream=sys.stdout, force=True)
     load_env()
+    web.start()
+    if unknown:
+        log.warning("BOT_ARGS: не понял и пропускаю: %s", " ".join(unknown))
 
-    key, sec = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
-    if not a.dry and not (key and sec):
-        sys.exit("Нет ключей: создай .env с BYBIT_API_KEY и BYBIT_API_SECRET (или запусти с --dry)")
     if os.getenv("BYBIT_ENV", "").lower() == "testnet":
         a.testnet = True
     live = not a.testnet
+    web.update(mode=("РЕАЛЬНЫЙ СЧЁТ" if live else "TESTNET") + (" · dry-run" if a.dry else ""),
+               budget=a.budget, leverage=a.leverage, state="проверка доступа")
+
+    key, sec = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
+    if not a.dry and not (key and sec):
+        wait_forever("Нет ключей: добавь в Railway → Variables переменные BYBIT_API_KEY и BYBIT_API_SECRET")
 
     # Railway при редеплое/остановке шлёт SIGTERM -> закрываем сетку как по Ctrl+C
     def _term(*_):
@@ -386,15 +423,25 @@ def main():
     s = HTTP(testnet=not live, api_key=key, api_secret=sec)
     log.info("Режим: %s%s | маржа на сетку %s$, плечо %sx", "РЕАЛЬНЫЙ СЧЁТ" if live else "TESTNET",
              " (dry-run)" if a.dry else "", a.budget, a.leverage)
-    check_access(s, a)
+    err = check_access(s, a)
+    if err:
+        wait_forever(err)
     inst = load_instruments(s)
     log.info("Инструментов: %d", len(inst))
+    last_bal = time.time()
 
     cooldown = {}
     grid = None
     try:
         while True:
-            cands = scan(s, inst, a)
+            web.update(state="сканирую рынок", error="")
+            try:
+                cands = scan(s, inst, a)
+            except Exception as e:  # noqa: BLE001
+                log.error("Ошибка скана: %s", e)
+                web.update(error="Ошибка скана: %s" % e)
+                time.sleep(30)
+                continue
             now = time.time()
             cands = [c for c in cands if cooldown.get(c["symbol"], 0) < now]
             grid = None
@@ -410,10 +457,13 @@ def main():
                     log.info("%s", e)
             if not grid:
                 log.info("Подходящих пар нет, жду 60 сек")
+                web.update(state="подходящих монет нет, жду")
                 time.sleep(60)
                 continue
 
+            web.update(state="ставлю сетку " + grid.sym)
             grid.start(next(c["price"] for c in cands if c["symbol"] == grid.sym))
+            web.update(state="сетка работает: " + grid.sym)
             if a.dry:
                 cooldown[grid.sym] = now + a.cooldown * 60
                 grid = None
@@ -425,6 +475,9 @@ def main():
                 try:
                     grid.sync()
                     reason = grid.check_exit()
+                    if time.time() - last_bal > 60:
+                        last_bal = time.time()
+                        balance(s)
                 except Exception as e:  # noqa: BLE001
                     log.error("Ошибка цикла: %s", e)
                     continue
