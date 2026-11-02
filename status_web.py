@@ -79,8 +79,11 @@ def render():
           <div><span>Объём на уровень</span><b>{escape(str(g['qty']))}</b></div>
           <div><span>Ордеров открыто</span><b>{g.get('open_orders', '—')}</b></div>
           <div><span>Исполнений</span><b>{g.get('fills', 0)}</b></div>
-          <div><span>Прибыль сетки ≈</span><b class="{'pos' if g.get('profit', 0) >= 0 else 'neg'}">{g.get('profit', 0):.3f} $</b></div>
+          <div><span>PnL сетки ≈</span><b class="{'pos' if g.get('profit', 0) >= 0 else 'neg'}">{g.get('profit', 0):.3f} $</b></div>
+          <div><span>Позиция</span><b>{_fmt(g.get('net', 0))}</b></div>
+          <div><span>Сдвигов за ценой</span><b>{g.get('shifts', 0)}</b></div>
           <div><span>Работает</span><b>{(time.time() - g['started']) / 60:.0f} мин</b></div>
+          {f'<div><span>Закрываю лимитками</span><b class="neg">{escape(g["closing"])}</b></div>' if g.get('closing') else ''}
         </div>"""
     else:
         grid_html = '<p class="muted">Сейчас сетки нет — бот ищет монету.</p>'

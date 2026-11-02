@@ -7,14 +7,15 @@ Bybit: сканер волатильности + авто нейтральная
      и без тренда (низкий Efficiency Ratio).
   2. Берёт лучшую пару, считает границы и уровни сетки.
   3. Ставит лимитки: Buy ниже цены, Sell выше, один уровень у цены пустой.
-  4. Каждые N секунд проверяет исполнения: Buy на уровне i исполнен -> Sell на i+1,
-     Sell на уровне i исполнен -> Buy на i-1. Это и есть нейтральная сетка.
-  5. Закрывает сетку (отмена ордеров + закрытие позиции по рынку), если:
-       - цена ушла за границу дальше чем на --stop %
-       - достигнут --tp-usdt (оценка прибыли)
-       - прошло --max-minutes
-       - пара перешла в тренд (ER > --exit-er)
-  6. Пауза для этой пары и поиск следующей.
+  4. Каждую секунду проверяет исполнения: Buy на уровне i исполнен -> Sell на i+1,
+     Sell на уровне i исполнен -> Buy на i-1. Сетка сразу обновляется.
+  5. Цена ушла за край сетки -> сетка той же ширины перестраивается вокруг цены (идёт за ценой).
+     Позиция не растёт больше маржи × плечо.
+  6. Закрывает сетку, если: достигнут --tp-usdt, убыток больше --max-loss %% маржи,
+     прошло --max-minutes, или (по желанию) тренд ER > --exit-er.
+     Закрытие ТОЛЬКО лимитками с догоном: мейкер у лучшей цены, перестановка каждые
+     --chase-sec, затем быстрая лимитка через спред. Маркет-ордеров нет.
+  7. Пауза для этой пары и поиск следующей.
 
 Установка:
   pip install pybit
@@ -30,7 +31,7 @@ Bybit: сканер волатильности + авто нейтральная
   python bybit_grid_bot.py --testnet        # учебный счёт, ключи от testnet.bybit.com
 
 Аккаунт должен быть в One-Way Mode (не Hedge) для USDT perpetual.
-Ctrl+C: бот отменит ордера и закроет позицию текущей сетки (если не указан --keep-on-exit).
+Ctrl+C / остановка сервиса: бот снимет ордера и закроет позицию лимитками (до --term-timeout сек).
 """
 
 import argparse
@@ -179,138 +180,282 @@ def scan(s, inst, a):
 
 # ---------------------------------------------------------------- grid
 
+def position(s, sym):
+    """(сторона, размер, positionIdx) текущей позиции или (None, 0, 0)."""
+    r = api(s.get_positions, category=CAT, symbol=sym)
+    for p in r["result"]["list"]:
+        size = D(p.get("size") or 0)
+        if size > 0:
+            return p["side"], size, int(p.get("positionIdx") or 0)
+    return None, D(0), 0
+
+
+def chase_flat(s, sym, ins, a, timeout):
+    """Закрыть позицию ТОЛЬКО лимитками с догоном (без маркета).
+
+    Сначала мейкер-лимитка у лучшей цены (PostOnly), через --chase-sec снимаем и
+    переставляем к новой цене. После --chase-tries попыток — быстрая лимитка через спред
+    (IOC, цена ограничена --chase-slip тиками). Повтор, пока позиция не станет 0.
+    """
+    tick = ins["tick"]
+    t_end = time.time() + timeout
+    tries = 0
+    while time.time() < t_end:
+        side, size, idx = position(s, sym)
+        if size <= 0:
+            return True
+        close_side = "Sell" if side == "Buy" else "Buy"
+        ob = api(s.get_orderbook, category=CAT, symbol=sym, limit=1)["result"]
+        bid, ask = D(ob["b"][0][0]), D(ob["a"][0][0])
+        if tries < a.chase_tries:
+            if close_side == "Sell":
+                px = ask - tick if ask - tick > bid else ask
+            else:
+                px = bid + tick if bid + tick < ask else bid
+            tif = "PostOnly"
+        else:
+            px = bid - tick * a.chase_slip if close_side == "Sell" else ask + tick * a.chase_slip
+            tif = "IOC"
+        tries += 1
+        try:
+            r = api(s.place_order, category=CAT, symbol=sym, side=close_side, orderType="Limit",
+                    qty=str(size), price=str(px), timeInForce=tif, reduceOnly=True, positionIdx=idx)
+            oid = r["result"]["orderId"]
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: лимитка закрытия не встала (%s), повтор", sym, str(e)[:120])
+            time.sleep(0.5)
+            continue
+        log.info("%s: закрываю %s %s лимиткой %s @ %s (попытка %d)", sym, close_side, size, tif, px, tries)
+        if tif == "PostOnly":
+            time.sleep(a.chase_sec)
+            try:
+                s.cancel_order(category=CAT, symbol=sym, orderId=oid)
+            except Exception:  # noqa: BLE001
+                pass  # уже исполнена или отклонена
+        else:
+            time.sleep(0.3)
+    return position(s, sym)[1] <= 0
+
+
 class Grid:
+    """Нейтральная сетка, которая идёт за ценой. Только лимитные ордера."""
+
     def __init__(self, s, a, cand, ins):
         self.s, self.a, self.ins = s, a, ins
         self.sym = cand["symbol"]
-        n = cand["grids"]
-        lo, hi = cand["lower"], cand["upper"]
-        step = (hi - lo) / n
-        self.levels = [round_step(lo + i * step, ins["tick"], ROUND_HALF_UP) for i in range(n + 1)]
-        self.lower, self.upper = float(self.levels[0]), float(self.levels[-1])
-        self.step_price = (self.levels[-1] - self.levels[0]) / n
+        self.n = cand["grids"]
+        self.tick = ins["tick"]
         price = D(cand["price"])
-
         self.lev = min(a.leverage, ins["max_lev"])
-        notional = D(a.budget) * D(self.lev) / D(n)
+        notional = D(a.budget) * D(self.lev) / D(self.n)
         self.qty = round_step(notional / price, ins["qty_step"])
         if self.qty < ins["min_qty"] or self.qty * price < ins["min_notional"]:
-            raise ValueError(f"{self.sym}: бюджет мал для {n} уровней "
+            raise ValueError(f"{self.sym}: бюджет мал для {self.n} уровней "
                              f"(qty {self.qty} < min {ins['min_qty']} или < {ins['min_notional']}$)")
-
-        self.orders = {}          # orderId -> (level_idx, side, is_pair)
-        self.realized_est = 0.0
+        # максимум позиции в одну сторону = вся маржа × плечо
+        self.max_pos = float(self.qty) * self.n
+        self.set_levels(cand["lower"], cand["upper"])
+        self.want = {}      # уровень -> "Buy"/"Sell": что должно стоять
+        self.live = {}      # orderId -> (уровень, сторона)
+        self.net = 0.0      # позиция сетки (+ лонг, − шорт)
+        self.avg = 0.0
+        self.realized = 0.0
         self.fills = 0
+        self.shifts = 0
         self.t0 = time.time()
+        self.out_since = None
+        self.price = float(price)
+        self.er_checked = 0.0
+        self.closing = ""
 
-    def publish(self, open_orders=None):
+    # --- уровни
+    def set_levels(self, lo, hi):
+        step = (D(hi) - D(lo)) / D(self.n)
+        self.levels = [round_step(D(lo) + i * step, self.tick, ROUND_HALF_UP) for i in range(self.n + 1)]
+        self.lower, self.upper = float(self.levels[0]), float(self.levels[-1])
+        self.step_price = float(self.levels[-1] - self.levels[0]) / self.n
+
+    def layout(self, price):
+        """Buy ниже цены, Sell выше, уровень у цены пустой."""
+        empty = min(range(self.n + 1), key=lambda i: abs(float(self.levels[i]) - price))
+        self.want = {i: ("Buy" if i < empty else "Sell") for i in range(self.n + 1) if i != empty}
+
+    # --- учёт позиции и прибыли
+    def book(self, side, px, qty):
+        q = qty if side == "Buy" else -qty
+        if self.net == 0 or (self.net > 0) == (q > 0):
+            tot = abs(self.net) + abs(q)
+            self.avg = (self.avg * abs(self.net) + px * abs(q)) / tot
+            self.net += q
+        else:
+            closing = min(abs(q), abs(self.net))
+            self.realized += (px - self.avg) * closing * (1 if self.net > 0 else -1)
+            self.net += q
+            if abs(self.net) < 1e-12:
+                self.net, self.avg = 0.0, 0.0
+            elif (self.net > 0) == (q > 0):
+                self.avg = px  # позиция перевернулась
+        self.realized -= self.a.fee / 100 * px * qty
+
+    def pnl(self):
+        return self.realized + (self.price - self.avg) * self.net
+
+    def publish(self):
         web.update(grid={
-            "symbol": self.sym, "lower": self.lower, "upper": self.upper, "levels": len(self.levels) - 1,
-            "step_pct": float(self.step_price) / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
-            "open_orders": len(self.orders) if open_orders is None else open_orders,
-            "fills": self.fills, "profit": self.realized_est, "started": self.t0})
+            "symbol": self.sym, "lower": self.lower, "upper": self.upper, "levels": self.n,
+            "step_pct": self.step_price / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
+            "open_orders": len(self.live), "fills": self.fills, "profit": self.pnl(),
+            "net": self.net, "shifts": self.shifts, "started": self.t0, "closing": self.closing})
 
-    # --- orders
-    def place(self, i, side, is_pair):
-        price = self.levels[i]
+    # --- ордера
+    def can_place(self, side):
+        """Не даём позиции вырасти больше маржи × плечо, даже если сетка ушла за ценой."""
+        same = sum(1 for _, sd in self.live.values() if sd == side)
+        q = float(self.qty)
+        proj = (self.net if side == "Buy" else -self.net) + q * (same + 1)
+        return proj <= self.max_pos * 1.0001
+
+    def place(self, i, side):
         if self.a.dry:
             return
         try:
             r = api(self.s.place_order, category=CAT, symbol=self.sym, side=side, orderType="Limit",
-                    qty=str(self.qty), price=str(price), timeInForce="GTC", positionIdx=0)
-            self.orders[r["result"]["orderId"]] = (i, side, is_pair)
+                    qty=str(self.qty), price=str(self.levels[i]), timeInForce="GTC", positionIdx=0)
+            self.live[r["result"]["orderId"]] = (i, side)
         except Exception as e:  # noqa: BLE001
-            log.error("%s: не удалось поставить %s @ %s: %s", self.sym, side, price, e)
+            log.error("%s: не удалось поставить %s @ %s: %s", self.sym, side, self.levels[i], e)
 
+    def refill(self):
+        """Поставить всё, чего не хватает в сетке (после исполнения, сдвига, снятия)."""
+        placed = {i for i, _ in self.live.values()}
+        for i, side in sorted(self.want.items()):
+            if i not in placed and self.can_place(side):
+                self.place(i, side)
+
+    def order_info(self, oid):
+        r = api(self.s.get_order_history, category=CAT, symbol=self.sym, orderId=oid)
+        lst = r["result"]["list"]
+        return lst[0] if lst else None
+
+    def on_done(self, oid, info):
+        """Ордер сетки ушёл из открытых: исполнен -> встречный на соседний уровень."""
+        i, side = self.live.pop(oid)
+        st = info["orderStatus"]
+        done = float(info.get("cumExecQty") or 0)
+        if done > 0:
+            self.book(side, float(info.get("avgPrice") or self.levels[i]), done)
+        if st == "Filled":
+            self.fills += 1
+            self.want.pop(i, None)
+            if side == "Buy" and i + 1 <= self.n:
+                self.want[i + 1] = "Sell"
+            elif side == "Sell" and i - 1 >= 0:
+                self.want[i - 1] = "Buy"
+            log.info("%s: исполнен %s @ %s | позиция %.6g | PnL≈%.3f$",
+                     self.sym, side, self.levels[i], self.net, self.pnl())
+
+    def sync(self):
+        r = api(self.s.get_open_orders, category=CAT, symbol=self.sym, limit=50)
+        open_ids = {o["orderId"] for o in r["result"]["list"]}
+        for oid in [x for x in self.live if x not in open_ids]:
+            info = self.order_info(oid)
+            if info is not None:
+                self.on_done(oid, info)
+        self.refill()
+        self.publish()
+
+    def cancel_grid(self):
+        api(self.s.cancel_all_orders, category=CAT, symbol=self.sym)
+        for oid in list(self.live):
+            info = None
+            try:
+                info = self.order_info(oid)
+            except Exception:  # noqa: BLE001
+                pass
+            if info:
+                self.on_done(oid, info)
+            else:
+                self.live.pop(oid, None)
+
+    def last_price(self):
+        t = api(self.s.get_tickers, category=CAT, symbol=self.sym)["result"]["list"][0]
+        self.price = float(t["lastPrice"])
+        return self.price
+
+    def follow(self, price):
+        """Цена ушла за край сетки -> перестроить сетку той же ширины вокруг цены."""
+        edge = self.step_price * self.a.shift_steps
+        if self.lower - edge <= price <= self.upper + edge:
+            self.out_since = None
+            return
+        if self.out_since is None:
+            self.out_since = time.time()
+        if time.time() - self.out_since < self.a.shift_sec:
+            return
+        half = (self.upper - self.lower) / 2
+        self.cancel_grid()
+        self.set_levels(price - half, price + half)
+        self.layout(price)
+        self.shifts += 1
+        self.out_since = None
+        log.info("%s: сетка пошла за ценой (сдвиг %d): %s … %s", self.sym, self.shifts, self.lower, self.upper)
+        self.refill()
+
+    # --- запуск / выход
     def start(self, price):
+        self.layout(price)
         log.info("СЕТКА %s: %s … %s, уровней %d, шаг %.3f%%, qty %s, плечо %sx",
-                 self.sym, self.lower, self.upper, len(self.levels) - 1,
-                 float(self.step_price) / price * 100, self.qty, self.lev)
-        empty = min(range(len(self.levels)), key=lambda i: abs(float(self.levels[i]) - price))
-        plan = [(i, "Buy" if i < empty else "Sell") for i in range(len(self.levels)) if i != empty]
+                 self.sym, self.lower, self.upper, self.n, self.step_price / price * 100, self.qty, self.lev)
         if self.a.dry:
-            for i, side in plan:
+            for i, side in sorted(self.want.items()):
                 log.info("  [dry] %s %s @ %s", side, self.qty, self.levels[i])
             return
         api(self.s.set_leverage, category=CAT, symbol=self.sym,
             buyLeverage=str(self.lev), sellLeverage=str(self.lev))
         api(self.s.cancel_all_orders, category=CAT, symbol=self.sym)
-        for i, side in plan:
-            self.place(i, side, is_pair=False)
-        log.info("%s: поставлено %d ордеров", self.sym, len(self.orders))
+        self.refill()
+        log.info("%s: поставлено %d ордеров", self.sym, len(self.live))
         self.publish()
 
-    def order_status(self, oid):
-        r = api(self.s.get_order_history, category=CAT, symbol=self.sym, orderId=oid)
-        lst = r["result"]["list"]
-        return lst[0]["orderStatus"] if lst else None
-
-    def sync(self):
-        r = api(self.s.get_open_orders, category=CAT, symbol=self.sym, limit=50)
-        open_ids = {o["orderId"] for o in r["result"]["list"]}
-        for oid in [x for x in self.orders if x not in open_ids]:
-            st = self.order_status(oid)
-            if st is None:
-                continue                      # история ещё не обновилась
-            i, side, is_pair = self.orders.pop(oid)
-            if st == "Filled":
-                self.fills += 1
-                if is_pair:
-                    self.realized_est += float(self.qty * self.step_price) \
-                        - 2 * self.a.fee / 100 * float(self.qty * self.levels[i])
-                log.info("%s: исполнен %s @ %s (сделок %d, прибыль≈%.3f$)",
-                         self.sym, side, self.levels[i], self.fills, self.realized_est)
-                if side == "Buy" and i + 1 < len(self.levels):
-                    self.place(i + 1, "Sell", is_pair=True)
-                elif side == "Sell" and i - 1 >= 0:
-                    self.place(i - 1, "Buy", is_pair=True)
-            elif st in ("Cancelled", "Rejected", "Deactivated"):
-                log.warning("%s: ордер %s @ %s %s, ставлю заново", self.sym, side, self.levels[i], st)
-                self.place(i, side, is_pair)
-        self.publish(len(self.orders))
-
-    def unrealised(self):
-        r = api(self.s.get_positions, category=CAT, symbol=self.sym)
-        return sum(float(p.get("unrealisedPnl") or 0) for p in r["result"]["list"])
-
-    def check_exit(self):
-        price = float(api(self.s.get_tickers, category=CAT, symbol=self.sym)["result"]["list"][0]["lastPrice"])
-        if price < self.lower * (1 - self.a.stop / 100) or price > self.upper * (1 + self.a.stop / 100):
-            return f"цена {price} вышла за диапазон"
+    def check_exit(self, price):
         if (time.time() - self.t0) / 60 >= self.a.max_minutes:
             return "истекло время"
-        if self.a.tp_usdt > 0:
-            total = self.realized_est + self.unrealised()
-            if total >= self.a.tp_usdt:
-                return f"тейк-профит {total:.2f}$"
-        m = analyze(klines(self.s, self.sym, self.a.window + 1), self.a)
-        if m and m["er"] > self.a.exit_er:
-            return f"тренд (ER={m['er']:.2f})"
+        pnl = self.pnl()
+        if self.a.tp_usdt > 0 and pnl >= self.a.tp_usdt:
+            return f"тейк-профит {pnl:.2f}$"
+        if self.a.max_loss > 0 and pnl <= -self.a.budget * self.a.max_loss / 100:
+            return f"стоп по убытку {pnl:.2f}$"
+        if self.a.exit_er > 0 and time.time() - self.er_checked > 30:
+            self.er_checked = time.time()
+            m = analyze(klines(self.s, self.sym, self.a.window + 1), self.a)
+            if m and m["er"] > self.a.exit_er:
+                return f"тренд (ER={m['er']:.2f})"
         return None
 
-    def close(self, reason):
-        log.info("%s: ЗАКРЫТИЕ — %s", self.sym, reason)
+    def close(self, reason, timeout=None):
+        """Снять сетку и закрыть позицию лимитками с догоном. True, если позиция закрыта."""
+        if not self.closing:
+            log.info("%s: ЗАКРЫТИЕ — %s", self.sym, reason)
+        self.closing = reason
+        self.publish()
         if self.a.dry:
-            return
-        api(self.s.cancel_all_orders, category=CAT, symbol=self.sym)
-        r = api(self.s.get_positions, category=CAT, symbol=self.sym)
-        for p in r["result"]["list"]:
-            if float(p.get("size") or 0) > 0:
-                side = "Sell" if p["side"] == "Buy" else "Buy"
-                api(self.s.place_order, category=CAT, symbol=self.sym, side=side, orderType="Market",
-                    qty=p["size"], reduceOnly=True, positionIdx=int(p.get("positionIdx", 0)))
-                log.info("%s: позиция %s %s закрыта по рынку", self.sym, p["side"], p["size"])
-        log.info("%s: итог по оценке: сделок %d, сеточная прибыль≈%.3f$", self.sym, self.fills, self.realized_est)
+            return True
+        self.cancel_grid()
+        ok = chase_flat(self.s, self.sym, self.ins, self.a, timeout or self.a.close_timeout)
+        if not ok:
+            log.error("%s: позиция ещё не закрыта, продолжаю догон лимитками", self.sym)
+            return False
+        log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
         with web.LOCK:
             web.STATUS["history"].append({"time": time.strftime("%d.%m %H:%M UTC", time.gmtime()), "symbol": self.sym,
-                                          "fills": self.fills, "profit": self.realized_est, "reason": reason})
+                                          "fills": self.fills, "profit": self.pnl(), "reason": reason})
             web.STATUS["history"] = web.STATUS["history"][-100:]
             web.STATUS["grid"] = None
+        return True
 
     def has_position(self):
         """Есть ли уже позиция или ордера на этой монете (например, от другого бота на счёте)."""
-        r = api(self.s.get_positions, category=CAT, symbol=self.sym)
-        if any(float(p.get("size") or 0) > 0 for p in r["result"]["list"]):
+        if position(self.s, self.sym)[1] > 0:
             return True
         o = api(self.s.get_open_orders, category=CAT, symbol=self.sym, limit=1)
         return bool(o["result"]["list"])
@@ -384,11 +529,19 @@ def main():
     p.add_argument("--budget", type=float, default=50, help="маржа на одну сетку, USDT")
     p.add_argument("--leverage", type=float, default=3)
     p.add_argument("--max-levels", type=int, default=20, help="макс. уровней сетки (≤40)")
-    p.add_argument("--stop", type=float, default=0.5, help="стоп: %% за границей сетки")
+    p.add_argument("--max-loss", type=float, default=30, help="стоп: убыток в %% от маржи (0 = выкл)")
     p.add_argument("--tp-usdt", type=float, default=0, help="закрыть при прибыли ≥ X$ (0 = выкл)")
     p.add_argument("--max-minutes", type=float, default=60, help="макс. жизнь сетки, мин")
-    p.add_argument("--exit-er", type=float, default=0.75, help="закрыть, если ER выше (тренд)")
-    p.add_argument("--poll", type=float, default=3, help="опрос ордеров, сек")
+    p.add_argument("--exit-er", type=float, default=0, help="закрыть, если ER выше (тренд); 0 = выкл")
+    p.add_argument("--poll", type=float, default=1, help="опрос ордеров, сек")
+    # сетка идёт за ценой
+    p.add_argument("--shift-steps", type=float, default=1, help="сдвиг, когда цена дальше края на N шагов")
+    p.add_argument("--shift-sec", type=float, default=0, help="сколько сек цена должна быть за краем до сдвига")
+    # закрытие только лимитками с догоном
+    p.add_argument("--chase-sec", type=float, default=1.5, help="сколько ждать мейкер-лимитку перед перестановкой")
+    p.add_argument("--chase-tries", type=int, default=5, help="мейкер-попыток, потом быстрая лимитка через спред")
+    p.add_argument("--chase-slip", type=int, default=5, help="быстрая лимитка: макс. тиков за лучшей ценой")
+    p.add_argument("--close-timeout", type=float, default=120, help="сек на одну серию догона")
     p.add_argument("--cooldown", type=float, default=30, help="пауза для пары после закрытия, мин")
     # сканер
     p.add_argument("--window", type=int, default=15, help="окно, 1m свечей")
@@ -399,6 +552,7 @@ def main():
     p.add_argument("--fee", type=float, default=0.055, help="комиссия, %% (taker Bybit 0.055)")
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
+    p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
     # На Railway параметры удобно задавать переменной BOT_ARGS, например:
     #   BOT_ARGS=--budget 30 --leverage 3 --tp-usdt 1
     argv = sys.argv[1:] or normalize_args(os.getenv("BOT_ARGS", ""), p)
@@ -487,31 +641,32 @@ def main():
 
             while True:
                 time.sleep(a.poll)
-                if web.CONTROL["paused"]:
+                reason = "стоп со страницы" if web.CONTROL["paused"] else grid.closing
+                if not reason:
                     try:
-                        grid.close("стоп со страницы")
+                        grid.sync()
+                        price = grid.last_price()
+                        grid.follow(price)
+                        reason = grid.check_exit(price)
+                        if time.time() - last_bal > 60:
+                            last_bal = time.time()
+                            balance(s)
+                    except Exception as e:  # noqa: BLE001
+                        log.error("Ошибка цикла: %s", e)
+                        continue
+                if reason:
+                    try:
+                        if grid.close(reason):
+                            break
                     except Exception as e:  # noqa: BLE001
                         log.error("Ошибка закрытия: %s — повтор", e)
-                        continue
-                    break
-                try:
-                    grid.sync()
-                    reason = grid.check_exit()
-                    if time.time() - last_bal > 60:
-                        last_bal = time.time()
-                        balance(s)
-                except Exception as e:  # noqa: BLE001
-                    log.error("Ошибка цикла: %s", e)
-                    continue
-                if reason:
-                    grid.close(reason)
-                    break
             cooldown[grid.sym] = time.time() + a.cooldown * 60
             grid = None
     except KeyboardInterrupt:
         log.info("Остановка…")
         if grid and not a.keep_on_exit and not a.dry:
-            grid.close("ручная остановка")
+            web.update(state="перезапуск: закрываю позицию лимитками")
+            grid.close("перезапуск/остановка сервиса", timeout=a.term_timeout)
 
 
 if __name__ == "__main__":
