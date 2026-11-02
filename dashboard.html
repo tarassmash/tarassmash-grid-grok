@@ -342,6 +342,8 @@ let bt = null, btIndex = 0, replayTimer = null;
 const fmt = (v, d) => v == null || isNaN(v) ? '—' : Number(v).toLocaleString('en-US', { maximumFractionDigits: d ?? (Math.abs(v) < 10 ? 4 : 2), minimumFractionDigits: 0 });
 const money = v => (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
 const short = s => s.replace('USDT', '');
+const NAMES = { SPYUSDT: 'S&P 500 (SPY)', QQQUSDT: 'Nasdaq 100 (QQQ)' };
+const label = s => NAMES[s] || short(s) + '/USDT';
 function toast(t) { const e = $('toast'); e.textContent = t; e.style.opacity = 1; clearTimeout(e._t); e._t = setTimeout(() => e.style.opacity = 0, 2200); }
 try { $('ctrl-key').value = localStorage.getItem('ctrlKey') || ''; } catch (e) {}
 
@@ -381,7 +383,7 @@ function changeTf(tf) {
 function changeSymbol(sym) {
   currentSymbol = sym;
   [...$('sym-buttons').children].forEach(b => b.className = 'px-3 py-1.5 rounded-md font-semibold transition ' + (b.dataset.sym === sym ? 'text-white bg-brand-600' : 'text-gray-400 hover:text-white'));
-  $('chart-title').textContent = `${short(sym)}/USDT • Bybit`;
+  $('chart-title').textContent = `${label(sym)} • Bybit`;
   Object.keys(lines).forEach(k => setLine(k, null));
   loadCandles(true);
   if (S) render();
@@ -403,8 +405,8 @@ async function poll() {
   }
 }
 function initSymbols() {
-  $('sym-buttons').innerHTML = S.symbols.map(s => `<button data-sym="${s}" onclick="changeSymbol('${s}')" class="px-3 py-1.5 rounded-md">${short(s)}/USDT</button>`).join('');
-  $('bt-asset').innerHTML = S.symbols.map(s => `<option value="${s}">${short(s)}/USDT</option>`).join('');
+  $('sym-buttons').innerHTML = S.symbols.map(s => `<button data-sym="${s}" onclick="changeSymbol('${s}')" class="px-3 py-1.5 rounded-md">${label(s)}</button>`).join('');
+  $('bt-asset').innerHTML = S.symbols.map(s => `<option value="${s}">${label(s)}</option>`).join('');
   $('opt-sym').innerHTML = $('bt-asset').innerHTML;
   $('bt-risk').value = S.params.risk_pct;
   changeSymbol(S.symbols[0]);
@@ -419,7 +421,8 @@ function render() {
   const live = S.mode.startsWith('РЕАЛ');
   $('mode-badge').textContent = S.mode + (S.dry ? ' • DRY' : '');
   $('mode-badge').className = 'text-[10px] font-semibold px-2 py-0.5 rounded border uppercase tracking-wider ' + (live ? 'bg-red-500/20 text-red-300 border-red-500/30' : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30');
-  $('error-box').classList.toggle('hidden', !S.error); $('error-box').textContent = S.error || '';
+  const errText = S.error || m.bad || '';
+  $('error-box').classList.toggle('hidden', !errText); $('error-box').textContent = errText;
   $('live-price').textContent = fmt(m.price);
   $('clock').textContent = `${sess.kyiv} / ${sess.ny}`;
   $('key-row').classList.toggle('hidden', !S.control_key_required);
@@ -445,7 +448,7 @@ function render() {
   $('r-fee').textContent = `≈ ${(2 * p.fee_pct / p.sl_pct).toFixed(2)}R`;
 
   // рівні
-  $('pdh').textContent = fmt(m.pdh); $('pdl').textContent = fmt(m.pdl);
+  $('pdh').textContent = fmt(m.pdh) + (m.rth ? ' (сесія США)' : ''); $('pdl').textContent = fmt(m.pdl) + (m.rth ? ' (сесія США)' : '');
   setLine('pdh', m.pdh, '#3b82f6', 'PDH', LightweightCharts.LineStyle.Dashed);
   setLine('pdl', m.pdl, '#FF5252', 'PDL', LightweightCharts.LineStyle.Dashed);
 
@@ -465,7 +468,7 @@ function render() {
   // сканер
   const sig = S.events.find(e => e.kind === 'signal' || e.kind === 'trade');
   $('scan-title').textContent = sig ? (sig.kind === 'signal' ? 'Сигнал' : 'Угода') + ' • ' + new Date(sig.t).toLocaleTimeString('uk-UA') : 'Сканер PDH/PDL';
-  $('scan-desc').textContent = sig ? sig.text : (sess.active ? 'Вікно відкрите — бот перевіряє кожну закриту 1m свічку BTC, ETH, SOL.' : 'Бот чекає вікно NY. Сигнали шукаються тільки в цей час.');
+  $('scan-desc').textContent = sig ? sig.text : (sess.active ? `Вікно відкрите — бот перевіряє кожну закриту 1m свічку: ${S.symbols.map(label).join(', ')}.` : 'Бот чекає вікно NY. Сигнали шукаються тільки в цей час.');
 
   // події
   const color = { signal: 'text-brand-500', trade: 'text-white', win: 'ok', loss: 'text-bearish', warn: 'warn', info: 'text-gray-400' };
@@ -637,11 +640,11 @@ function renderOpt() {
     const m = S.markets[sym], r = m.opt;
     const pill = m.enabled ? '<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[11px] font-bold">ТОРГУЄ</span>'
                            : '<span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[11px] font-bold">НЕ ТОРГУЄ</span>';
-    if (!r) return `<div class="bg-dark-card border border-dark-border rounded-xl p-4"><div class="flex justify-between items-center mb-2"><b class="text-white">${short(sym)}/USDT</b>${pill}</div>
+    if (!r) return `<div class="bg-dark-card border border-dark-border rounded-xl p-4"><div class="flex justify-between items-center mb-2"><b class="text-white">${label(sym)}</b>${pill}</div>
       <p class="text-xs text-gray-400">Підбір ще не запускався.</p></div>`;
     const b = r.best;
     return `<div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
-      <div class="flex justify-between items-center"><b class="text-white text-sm">${short(sym)}/USDT</b>${pill}</div>
+      <div class="flex justify-between items-center"><b class="text-white text-sm">${label(sym)}</b>${pill}</div>
       <p class="text-xs ${r.applied ? 'text-emerald-300' : 'text-amber-300'}">${escapeHtml(r.reason)}</p>
       <div class="text-[11px] text-gray-400"><span class="text-gray-500">Діють зараз:</span><br><span class="text-white font-mono">${pTxt(m.params)}</span></div>
       ${b ? `<div class="text-[11px] text-gray-400"><span class="text-gray-500">Найкращі на підборі:</span><br><span class="font-mono">${pTxt(b.params)}</span></div>

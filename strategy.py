@@ -53,9 +53,50 @@ def ny_day(ts_ms):
     return datetime.fromtimestamp(ts_ms / 1000, NY).date()
 
 
+# Дни, когда биржа США закрыта (NYSE). В эти дни окна NY нет — бот не торгует.
+US_HOLIDAYS = {date.fromisoformat(x) for x in (
+    "2025-01-01", "2025-01-09", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19",
+    "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03",
+    "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05",
+    "2027-09-06", "2027-11-25", "2027-12-24",
+)}
+
+
+def trading_day(d):
+    return d.weekday() < 5 and d not in US_HOLIDAYS
+
+
+def prev_trading_day(d):
+    d -= timedelta(days=1)
+    while not trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def rth_bounds(d):
+    """Основная сессия США 9:30–16:00 по Нью-Йорку, UTC-мс."""
+    s = datetime.combine(d, dtime(9, 30), NY)
+    e = datetime.combine(d, dtime(16, 0), NY)
+    return int(s.timestamp() * 1000), int(e.timestamp() * 1000)
+
+
+def rth_levels(candles, d):
+    """Максимум и минимум основной сессии дня d по свечам (любого таймфрейма ≤ 30 мин)."""
+    s, e = rth_bounds(d)
+    xs = [c for c in candles if s <= c["t"] < e]
+    if not xs:
+        return None
+    return max(c["h"] for c in xs), min(c["l"] for c in xs)
+
+
 def in_session(ts_ms, p):
-    """Минутная свеча, начавшаяся в ts_ms, целиком лежит внутри окна."""
-    s, e = session_bounds(ny_day(ts_ms), p)
+    """Минутная свеча, начавшаяся в ts_ms, целиком лежит внутри окна торгового дня США."""
+    d = ny_day(ts_ms)
+    if not trading_day(d):
+        return False
+    s, e = session_bounds(d, p)
     return s <= ts_ms and ts_ms + 60_000 <= e
 
 
@@ -63,8 +104,11 @@ def session_info(now_ms, p):
     """Для страницы: идёт ли окно, сколько до начала/конца, время Киев/Нью-Йорк."""
     d = ny_day(now_ms)
     s, e = session_bounds(d, p)
-    if now_ms >= e:
-        s, e = session_bounds(d + timedelta(days=1), p)
+    if now_ms >= e or not trading_day(d):
+        d += timedelta(days=1)
+        while not trading_day(d):
+            d += timedelta(days=1)
+        s, e = session_bounds(d, p)
     active = s <= now_ms < e
     now = datetime.fromtimestamp(now_ms / 1000, UTC)
     return {
@@ -160,7 +204,18 @@ def simulate(side, entry, candles, p, start=0):
 
 # ---------------------------------------------------------------- бэктест
 
-def backtest(symbol, daily, minutes_for_day, p, days=30, balance=10000.0, now_ms=None):
+def day_levels(d, by_day, minutes_for_day, rth, p):
+    """PDH/PDL для торгового дня d.
+    Крипта: вчерашняя суточная свеча UTC. S&P 500 и др. TradFi: основная сессия прошлого торгового дня США."""
+    if rth:
+        pd = prev_trading_day(d)
+        return rth_levels(minutes_for_day(pd), pd)
+    s_ms, _ = session_bounds(d, p)
+    prev = by_day.get(utc_day_start(s_ms) - 86_400_000)
+    return (prev["h"], prev["l"]) if prev else None
+
+
+def backtest(symbol, daily, minutes_for_day, p, days=30, balance=10000.0, now_ms=None, rth=False):
     """Честный бэктест по свечам.
 
     daily: дневные свечи [{t,o,h,l,c}] (UTC), от старых к новым.
@@ -174,13 +229,12 @@ def backtest(symbol, daily, minutes_for_day, p, days=30, balance=10000.0, now_ms
     max_dd = 0.0
     for k in range(days, 0, -1):
         d = today - timedelta(days=k)
-        if d.weekday() >= 5:
-            continue  # NY сессия только в будни
-        s_ms, e_ms = session_bounds(d, p)
-        prev = by_day.get(utc_day_start(s_ms) - 86_400_000)
-        if not prev:
+        if not trading_day(d):
+            continue  # NY сессия только в торговые дни США
+        lv = day_levels(d, by_day, minutes_for_day, rth, p)
+        if not lv:
             continue
-        pdh, pdl = prev["h"], prev["l"]
+        pdh, pdl = lv
         mins = minutes_for_day(d)
         taken = 0
         i = 0
@@ -244,10 +298,19 @@ GRID = {
     "strong_body": [0.0, 0.5],
     "session_min": [30, 60, 90],
 }
+# S&P 500 (SPY) за час ходит меньше крипты — стопы и касания уже
+GRID_TRADFI = {
+    "sl_pct": [0.1, 0.15, 0.2, 0.3],
+    "tp_r": [1.5, 2.0, 3.0],
+    "be_r": [1.0, 2.0, 0.0],
+    "touch_pct": [0.03, 0.06, 0.12],
+    "strong_body": [0.0, 0.5],
+    "session_min": [30, 60, 90],
+}
 
 
-def collect_days(daily, minutes_for_day, days, now_ms, session_start="09:30", progress=None):
-    """Будние дни за последние `days` дней: уровни вчерашнего дня и 1m свечи от окна до конца суток."""
+def collect_days(daily, minutes_for_day, days, now_ms, session_start="09:30", progress=None, rth=False):
+    """Торговые дни США за последние `days` дней: уровни прошлого дня и 1m свечи от окна до конца суток."""
     by_day = {c["t"]: c for c in daily}
     today = ny_day(now_ms)
     out = []
@@ -256,15 +319,16 @@ def collect_days(daily, minutes_for_day, days, now_ms, session_start="09:30", pr
         d = today - timedelta(days=k)
         if progress:
             progress(n + 1, len(ks))
-        if d.weekday() >= 5:
+        if not trading_day(d):
             continue
-        s_ms, _ = session_bounds(d, Params(session_start=session_start, session_min=60))
-        prev = by_day.get(utc_day_start(s_ms) - 86_400_000)
-        if not prev:
+        p0 = Params(session_start=session_start, session_min=60)
+        s_ms, _ = session_bounds(d, p0)
+        lv = day_levels(d, by_day, minutes_for_day, rth, p0)
+        if not lv:
             continue
         mins = minutes_for_day(d)
         if mins:
-            out.append({"d": d, "s_ms": s_ms, "pdh": prev["h"], "pdl": prev["l"], "mins": mins})
+            out.append({"d": d, "s_ms": s_ms, "pdh": lv[0], "pdl": lv[1], "mins": mins})
     return out
 
 
@@ -333,7 +397,7 @@ def optimize(days_data, base, test_days=20, grid=None, min_train=8, min_test=3, 
                 progress(done, total)
     ok = [r for r in rows if r["train"]["n"] >= min_train and r["train"]["pf"] >= 1.1]
     ok.sort(key=lambda r: (r["train"]["sum_r"], r["train"]["pf"]), reverse=True)
-    base_row = next((r for r in rows if all(r["params"][k] == base.as_dict()[k] for k in GRID)), None)
+    base_row = next((r for r in rows if all(r["params"][k] == base.as_dict()[k] for k in grid)), None)
     if base_row is None:
         def run_base(xs):
             out = []

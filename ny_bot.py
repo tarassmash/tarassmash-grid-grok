@@ -42,6 +42,9 @@ class Bot:
     def __init__(self, s, a, p, live):
         self.s, self.a, self.p, self.live = s, a, p, live
         self.syms = [x.strip().upper() for x in a.symbols.split(",") if x.strip()]
+        # TradFi (S&P 500 и т.п.): уровни из основной сессии США, а не суточной свечи
+        self.rth = {x.strip().upper() for x in a.rth_symbols.split(",") if x.strip()}
+        self.bad = {}                             # монеты, которых нет/недоступны на бирже: причина
         self.public = HTTP(testnet=False)        # рыночные данные для бэктеста — всегда реальные
         self.ins = {}
         self.lv = {x: {"day": None, "pdh": 0.0, "pdl": 0.0} for x in self.syms}
@@ -124,6 +127,19 @@ class Bot:
             log.warning("Баланс не получен: %s", e)
 
     def refresh_levels(self, sym):
+        if sym in self.rth:
+            today = st.ny_day(now_ms())
+            day = today.isoformat()
+            if self.lv[sym]["day"] == day:
+                return
+            pd = st.prev_trading_day(today)
+            s_ms, e_ms = st.rth_bounds(pd)
+            lv = st.rth_levels(klines(self.s, sym, "5", limit=200, start=s_ms, end=e_ms - 1), pd)
+            if not lv:
+                return
+            self.lv[sym] = {"day": day, "pdh": lv[0], "pdl": lv[1]}
+            self.event(f"{sym}: уровни сессии США {pd:%d.%m} — PDH {lv[0]:g} / PDL {lv[1]:g}")
+            return
         day = datetime.now(UTC).date().isoformat()
         if self.lv[sym]["day"] == day:
             return
@@ -397,6 +413,8 @@ class Bot:
         self.run_commands()
         self.maybe_optimize()
         for sym in self.syms:
+            if sym in self.bad:
+                continue
             try:
                 self.refresh_levels(sym)
                 self.price[sym] = last_price(self.s, sym)
@@ -433,7 +451,15 @@ class Bot:
 
     def run(self):
         for sym in self.syms:
-            self.ins[sym] = instrument(self.s, sym)
+            if sym in self.ins:
+                continue
+            try:
+                self.ins[sym] = instrument(self.s, sym)
+                self.bad.pop(sym, None)
+            except Exception as e:  # noqa: BLE001
+                self.bad[sym] = f"{sym} недоступен на Bybit для этого аккаунта/API: {e}"
+                self.enabled[sym] = False
+                self.event(self.bad[sym], "warn")
         self.refresh_wallet()
         self.recover()
         self.event(f"Автопилот готов: {', '.join(self.syms)} | риск {self.p.risk_pct:g}% | окно "
@@ -473,16 +499,20 @@ class Bot:
         self.event(f"Автоподбор настроек ({why}): {self.a.opt_days} дней, проверка на последних {self.a.opt_test}")
         try:
             for sym in self.syms:
+                if sym in self.bad:
+                    continue
+                rth = sym in self.rth
+
                 def prog(i, n, sym=sym):
                     self.opt_state["progress"] = f"{sym}: свечи {i}/{n}"
                 daily = klines(self.public, sym, "D", limit=self.a.opt_days + 10)
                 days = st.collect_days(daily, lambda d, sym=sym: self.minutes_for(sym, d), self.a.opt_days,
-                                       now_ms(), self.p.session_start, progress=prog)
+                                       now_ms(), self.p.session_start, progress=prog, rth=rth)
 
                 def prog2(i, n, sym=sym):
                     self.opt_state["progress"] = f"{sym}: варианты {i}/{n}"
                 res = st.optimize(days, self.p, test_days=self.a.opt_test, min_train=self.a.opt_min_trades,
-                                  progress=prog2)
+                                  progress=prog2, grid=st.GRID_TRADFI if rth else st.GRID)
                 with self.lock:
                     self.opt[sym] = {**res, "time": now_ms()}
                     if self.a.auto_apply:
@@ -502,6 +532,8 @@ class Bot:
                                f"тело ≥{b.strong_body:g}, окно {b.session_min} мин")
                 # кэш минуток только за нужные дни
                 keep = {(sym, x["d"].isoformat()) for x in days}
+                if rth:
+                    keep |= {(sym, st.prev_trading_day(x["d"]).isoformat()) for x in days}
                 for k in [k for k in self.min_cache if k[0] == sym and k not in keep]:
                     self.min_cache.pop(k, None)
             self.bt_cache.clear()
@@ -540,7 +572,8 @@ class Bot:
                 "control_key_required": bool(web.CONTROL_KEY),
                 "markets": {s: {"price": self.price.get(s), **self.lv[s], "check": self.check[s],
                                 "taken_today": self.taken.get((s, day), 0), "params": self.ps[s].as_dict(),
-                                "enabled": self.enabled[s], "opt": self.opt[s]} for s in self.syms},
+                                "enabled": self.enabled[s], "opt": self.opt[s], "rth": s in self.rth,
+                                "bad": self.bad.get(s)} for s in self.syms},
                 "opt_state": {**self.opt_state, "auto": self.a.auto_opt, "apply": self.a.auto_apply,
                               "days": self.a.opt_days, "test": self.a.opt_test, "grid": st.GRID},
                 "trades": open_tr, "journal": self.journal[-100:][::-1], "stats": self.stats(),
@@ -563,7 +596,8 @@ class Bot:
             return self.bt_cache[key]
         p = st.Params(**{**self.ps[sym].as_dict(), "risk_pct": risk})
         daily = klines(self.public, sym, "D", limit=days + 10)
-        res = st.backtest(sym, daily, lambda d: self.minutes_for(sym, d), p, days=days, balance=balance)
+        res = st.backtest(sym, daily, lambda d: self.minutes_for(sym, d), p, days=days, balance=balance,
+                          rth=sym in self.rth)
         self.bt_cache[key] = res
         return res
 
@@ -572,7 +606,9 @@ def main():
     ap = argparse.ArgumentParser(description="NY Breakout Autopilot (Bybit)")
     ap.add_argument("--testnet", action="store_true")
     ap.add_argument("--dry", action="store_true", help="только сигналы, без ордеров")
-    ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT")
+    ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,SPYUSDT")
+    ap.add_argument("--rth-symbols", default="SPYUSDT,QQQUSDT,IWMUSDT,DIAUSDT",
+                    help="TradFi-контракты: уровни PDH/PDL из основной сессии США")
     ap.add_argument("--risk", type=float, default=1.0, help="риск на сделку, %% баланса")
     ap.add_argument("--sl", type=float, default=0.3, help="стоп, %% от входа")
     ap.add_argument("--tp-r", type=float, default=3.0)
