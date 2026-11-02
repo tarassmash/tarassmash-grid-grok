@@ -187,34 +187,36 @@ def scan(s, inst, a):
 
 
 def apply_brain(res, a):
-    """Нейросеть оценивает каждого кандидата и 3 варианта шага сетки.
-    Активна (прошла проверку) — выбирает шаг, сортирует по прогнозу и отсекает ожидаемый минус.
-    Не активна — бот работает по сканеру, а сеть запоминает признаки для обучения и пишет свои оценки."""
+    """Нейросеть оценивает каждую монету и все комбинации настроек сетки (шаг, ширина, геометрия, лот,
+    сдвиг, стоп, время) и предлагает маржу. Активна (прошла проверку) — бот ставит её настройки и пропускает
+    монеты с ожидаемым минусом. Не активна — бот торгует обычными настройками, а сеть учится и пишет оценки."""
     if not BRAIN:
         return res
     out, decided = [], []
     use = a.nn and BRAIN.active
     for c in res:
-        vs = BRAIN.evaluate(c)
-        if not vs:
+        r = BRAIN.evaluate(c)
+        if not r:
             continue
-        scored = [v for v in vs if v[2] is not None]
-        best = max(scored, key=lambda v: v[2]) if scored else vs[1]
-        normal = vs[1]
-        pick = best if use else normal
-        mult, levels, pred, feats = pick
-        take = (not use) or (pred is not None and pred > a.nn_min_edge)
-        c["nn"] = {"pred": pred, "feats": feats, "levels": levels}
+        cfg, levels, pred, feats = r["best"]
+        dcfg, dlevels, dpred, dfeats = r["default"]
         if use:
-            c["grids"] = levels
-        decided.append({"symbol": c["symbol"], "pred": best[2], "levels": best[1], "mult": best[0], "feats": best[3],
-                        "take": take, "variants": vs})
+            take = pred is not None and pred > a.nn_min_edge
+            c["cfg"], c["grids"], c["size"] = cfg, levels, r["size"]
+            c["nn"] = {"pred": pred, "feats": feats, "levels": levels, "cfg": cfg}
+            c["nn_fallback"] = {"pred": dpred, "feats": dfeats, "levels": dlevels, "cfg": dcfg}
+        else:
+            take = True
+            c["nn"] = {"pred": dpred, "feats": dfeats, "levels": dlevels, "cfg": None}
+        decided.append({"symbol": c["symbol"], "pred": pred, "pred_default": dpred if dpred is not None else 0.0,
+                        "levels": levels, "cfg": cfg, "feats": feats, "take": take, "size": r["size"]})
         if take:
             out.append(c)
     if use:
         out.sort(key=lambda c: c["nn"]["pred"], reverse=True)
     decided.sort(key=lambda x: x["pred"] if x["pred"] is not None else -99, reverse=True)
-    BRAIN.preds = [{k: d[k] for k in ("symbol", "pred", "levels", "mult", "take")} for d in decided]
+    BRAIN.preds = [{"symbol": d["symbol"], "pred": d["pred"], "pred_default": d["pred_default"], "levels": d["levels"],
+                    "cfg": nn.cfg_short(d["cfg"]), "size": d["size"], "take": d["take"]} for d in decided]
     try:
         BRAIN.log_decisions(decided, use)
     except Exception as e:  # noqa: BLE001
@@ -294,6 +296,14 @@ def chase_flat(s, sym, ins, a, timeout):
     return position(s, sym)[1] <= 0
 
 
+def cfg_text(cfg, levels, budget, a):
+    """Настройки сетки от нейросети — коротко, для лога и страницы."""
+    return (f"{'геометрическая' if cfg.get('geo') else 'обычная'}, {levels} ур., ширина ×{cfg.get('wmult', 1):g}, "
+            f"лот {'равный' if cfg.get('lotk', 1) == 1 else '×%g от цены' % cfg['lotk']}, "
+            f"сдвиг через {cfg.get('shift', a.shift_steps):g} шаг., стоп {cfg.get('stop', a.max_loss / a.leverage):g}% объёма, "
+            f"держу {cfg.get('hold', a.max_minutes):g} мин, маржа {budget:.2f}$")
+
+
 class Grid:
     """Нейтральная сетка, которая идёт за ценой. Только лимитные ордера."""
 
@@ -304,16 +314,37 @@ class Grid:
         self.tick = ins["tick"]
         price = D(cand["price"])
         self.lev = min(a.leverage, ins["max_lev"])
-        notional = D(a.budget) * D(self.lev) / D(self.n)
-        self.qty = round_step(notional / price, ins["qty_step"])
-        if self.qty < ins["min_qty"] or self.qty * price < ins["min_notional"]:
-            raise ValueError(f"{self.sym}: бюджет мал для {self.n} уровней "
-                             f"(qty {self.qty} < min {ins['min_qty']} или < {ins['min_notional']}$)")
-        # максимум позиции в одну сторону = вся маржа × плечо
-        self.max_pos = float(self.qty) * self.n
-        self.set_levels(cand["lower"], cand["upper"])
+        # настройки сетки: от нейросети (cfg) или обычные из BOT_ARGS
+        cfg = cand.get("cfg") or {}
+        self.cfg = cfg
+        self.geo = bool(cfg.get("geo", 0))                 # геометрическая: равный шаг в %
+        self.lotk = float(cfg.get("lotk", 1.0))            # рост лота на каждый уровень от цены
+        self.shift_steps = float(cfg.get("shift", a.shift_steps))
+        self.hold = float(cfg.get("hold", a.max_minutes))
+        self.budget = a.budget * float(cand.get("size", 1.0))
+        if cfg.get("stop") is not None:                    # стоп в % от объёма позиции
+            self.stop_usdt = self.budget * self.lev * float(cfg["stop"]) / 100
+        else:
+            self.stop_usdt = self.budget * a.max_loss / 100 if a.max_loss > 0 else None
+        lo, hi = float(cand["lower"]), float(cand["upper"])
+        wm = float(cfg.get("wmult", 1.0))
+        if wm != 1.0:
+            mid = (lo + hi) / 2
+            lo, hi = max(mid - (mid - lo) * wm, mid * 0.5), mid + (hi - mid) * wm
+        # объём всей сетки = маржа × плечо; максимум позиции в одну сторону — столько же
+        self.total = D(self.budget) * D(self.lev) / price
+        self.qty = round_step(self.total / D(self.n), ins["qty_step"])     # средний лот (для показа)
+        wts = [self.lotk ** abs(i - self.n // 2) for i in range(self.n + 1) if i != self.n // 2]
+        q_min = round_step(self.total * D(min(wts) / sum(wts)), ins["qty_step"])
+        if q_min < ins["min_qty"] or q_min * price < ins["min_notional"]:
+            raise ValueError(f"{self.sym}: маржи мало для {self.n} уровней "
+                             f"(лот {q_min} < min {ins['min_qty']} или < {ins['min_notional']}$)")
+        self.max_pos = float(self.total)
+        self.set_levels(lo, hi)
+        self.lvl_qty = {}   # уровень -> лот
+        self.want_qty = {}  # уровень -> лот встречного ордера (= исполненный объём)
         self.want = {}      # уровень -> (сторона, positionIdx): что должно стоять
-        self.live = {}      # orderId -> (уровень, сторона, positionIdx)
+        self.live = {}      # orderId -> (уровень, сторона, positionIdx, лот)
         self.hedge = False  # режим Hedge: лонг через positionIdx=1, шорт через 2
         self.long, self.lavg = 0.0, 0.0
         self.short, self.savg = 0.0, 0.0
@@ -326,12 +357,16 @@ class Grid:
         self.er_checked = 0.0
         self.closing = ""
         self.nn = cand.get("nn")
-        self.notional = float(self.qty) * self.n * float(price)
+        self.notional = float(self.total) * float(price)
 
     # --- уровни
     def set_levels(self, lo, hi):
-        step = (D(hi) - D(lo)) / D(self.n)
-        self.levels = [round_step(D(lo) + i * step, self.tick, ROUND_HALF_UP) for i in range(self.n + 1)]
+        if self.geo:
+            r = (D(hi) / D(lo)) ** (D(1) / D(self.n))
+            self.levels = [round_step(D(lo) * r ** i, self.tick, ROUND_HALF_UP) for i in range(self.n + 1)]
+        else:
+            step = (D(hi) - D(lo)) / D(self.n)
+            self.levels = [round_step(D(lo) + i * step, self.tick, ROUND_HALF_UP) for i in range(self.n + 1)]
         self.lower, self.upper = float(self.levels[0]), float(self.levels[-1])
         self.step_price = float(self.levels[-1] - self.levels[0]) / self.n
 
@@ -341,23 +376,28 @@ class Grid:
         (Buy закрывает шорт, Sell закрывает лонг), остальные открывают новую."""
         empty = min(range(self.n + 1), key=lambda i: abs(float(self.levels[i]) - price))
         self.want = {}
-        q = float(self.qty)
-        close_short = int(round(self.short / q)) if self.hedge else 0
-        close_long = int(round(self.long / q)) if self.hedge else 0
+        self.want_qty = {}
+        # лоты: растут в lotk раз на каждый уровень от цены (1.0 = все равные)
+        wts = {i: self.lotk ** abs(i - empty) for i in range(self.n + 1) if i != empty}
+        tot = sum(wts.values())
+        self.lvl_qty = {i: max(self.ins["min_qty"], round_step(self.total * D(w / tot), self.ins["qty_step"]))
+                        for i, w in wts.items()}
+        rem_short = self.short if self.hedge else 0.0
+        rem_long = self.long if self.hedge else 0.0
         for i in range(empty - 1, -1, -1):          # вниз от цены
             if not self.hedge:
                 self.want[i] = ("Buy", 0)
-            elif close_short > 0:
+            elif rem_short > 1e-12:
                 self.want[i] = ("Buy", 2)
-                close_short -= 1
+                rem_short -= float(self.lvl_qty[i])
             else:
                 self.want[i] = ("Buy", 1)
         for i in range(empty + 1, self.n + 1):      # вверх от цены
             if not self.hedge:
                 self.want[i] = ("Sell", 0)
-            elif close_long > 0:
+            elif rem_long > 1e-12:
                 self.want[i] = ("Sell", 1)
-                close_long -= 1
+                rem_long -= float(self.lvl_qty[i])
             else:
                 self.want[i] = ("Sell", 2)
 
@@ -414,20 +454,24 @@ class Grid:
             "symbol": self.sym, "lower": self.lower, "upper": self.upper, "levels": self.n,
             "step_pct": self.step_price / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
             "open_orders": len(self.live), "fills": self.fills, "profit": self.pnl(),
-            "net": (f"L {self.long:g} / S {self.short:g}" if self.hedge else self.net), "shifts": self.shifts, "started": self.t0, "closing": self.closing})
+            "net": (f"L {self.long:g} / S {self.short:g}" if self.hedge else self.net), "shifts": self.shifts, "started": self.t0, "closing": self.closing,
+            "budget": self.budget, "cfg": cfg_text(self.cfg, self.n, self.budget, self.a) if self.cfg else ""})
 
     # --- ордера
-    def can_place(self, side, idx):
+    def order_qty(self, i):
+        return self.want_qty.get(i) or self.lvl_qty.get(i) or self.qty
+
+    def can_place(self, side, idx, q):
         """Не даём позиции вырасти больше маржи × плечо, даже если сетка ушла за ценой."""
-        q = float(self.qty)
+        q = float(q)
         if self.hedge:
             if self.closes(side, idx):
                 return True
-            same = sum(1 for _, sd, ix in self.live.values() if sd == side and ix == idx)
+            same = sum(float(qq) for _, sd, ix, qq in self.live.values() if sd == side and ix == idx)
             cur = self.long if idx == 1 else self.short
-            return cur + q * (same + 1) <= self.max_pos * 1.0001
-        same = sum(1 for _, sd, _ix in self.live.values() if sd == side)
-        proj = (self.net if side == "Buy" else -self.net) + q * (same + 1)
+            return cur + same + q <= self.max_pos * 1.0001
+        same = sum(float(qq) for _, sd, _ix, qq in self.live.values() if sd == side)
+        proj = (self.net if side == "Buy" else -self.net) + same + q
         return proj <= self.max_pos * 1.0001
 
     def place(self, i, side, idx):
@@ -436,10 +480,11 @@ class Grid:
         kw = {}
         if self.closes(side, idx):
             kw["reduceOnly"] = True
+        q = self.order_qty(i)
         try:
             r = api(self.s.place_order, category=CAT, symbol=self.sym, side=side, orderType="Limit",
-                    qty=str(self.qty), price=str(self.levels[i]), timeInForce="GTC", positionIdx=idx, **kw)
-            self.live[r["result"]["orderId"]] = (i, side, idx)
+                    qty=str(q), price=str(self.levels[i]), timeInForce="GTC", positionIdx=idx, **kw)
+            self.live[r["result"]["orderId"]] = (i, side, idx, q)
         except Exception as e:  # noqa: BLE001
             msg = str(e)
             if self.closes(side, idx) and ("110017" in msg or "reduce" in msg.lower()):
@@ -450,9 +495,9 @@ class Grid:
 
     def refill(self):
         """Поставить всё, чего не хватает в сетке (после исполнения, сдвига, снятия)."""
-        placed = {i for i, _, _ in self.live.values()}
+        placed = {v[0] for v in self.live.values()}
         for i, (side, idx) in sorted(self.want.items()):
-            if i not in placed and self.can_place(side, idx):
+            if i not in placed and self.can_place(side, idx, self.order_qty(i)):
                 self.place(i, side, idx)
 
     def order_info(self, oid):
@@ -462,7 +507,7 @@ class Grid:
 
     def on_done(self, oid, info):
         """Ордер сетки ушёл из открытых: исполнен -> встречный на соседний уровень."""
-        i, side, idx = self.live.pop(oid)
+        i, side, idx, _q = self.live.pop(oid)
         st = info["orderStatus"]
         done = float(info.get("cumExecQty") or 0)
         if done > 0:
@@ -473,11 +518,15 @@ class Grid:
             # исполнился соседний и уже поставил сюда встречный, его не трогаем
             if self.want.get(i) == (side, idx):
                 self.want.pop(i, None)
-            # встречная лимитка на соседний уровень, по той же ноге (positionIdx)
+                self.want_qty.pop(i, None)
+            # встречная лимитка на соседний уровень, по той же ноге (positionIdx), тем же объёмом
+            filled = round_step(done, self.ins["qty_step"]) if done > 0 else self.order_qty(i)
             if side == "Buy" and i + 1 <= self.n:
                 self.want[i + 1] = ("Sell", idx)
+                self.want_qty[i + 1] = filled
             elif side == "Sell" and i - 1 >= 0:
                 self.want[i - 1] = ("Buy", idx)
+                self.want_qty[i - 1] = filled
             pos = f"L {self.long:g} / S {self.short:g}" if self.hedge else f"{self.net:g}"
             log.info("%s: исполнен %s @ %s | позиция %s | PnL≈%.3f$",
                      self.sym, side, self.levels[i], pos, self.pnl())
@@ -512,7 +561,7 @@ class Grid:
 
     def follow(self, price):
         """Цена ушла за край сетки -> перестроить сетку той же ширины вокруг цены."""
-        edge = self.step_price * self.a.shift_steps
+        edge = self.step_price * self.shift_steps
         if self.lower - edge <= price <= self.upper + edge:
             self.out_since = None
             return
@@ -535,11 +584,12 @@ class Grid:
             self.hedge = is_hedge(self.s, self.sym)
             log.info("%s: режим позиций %s", self.sym, "Hedge" if self.hedge else "One-Way")
         self.layout(price)
-        log.info("СЕТКА %s: %s … %s, уровней %d, шаг %.3f%%, qty %s, плечо %sx",
-                 self.sym, self.lower, self.upper, self.n, self.step_price / price * 100, self.qty, self.lev)
+        log.info("СЕТКА %s: %s … %s, уровней %d, шаг %.3f%%, лот ~%s, маржа %.2f$, плечо %sx%s",
+                 self.sym, self.lower, self.upper, self.n, self.step_price / price * 100, self.qty, self.budget, self.lev,
+                 (" | " + cfg_text(self.cfg, self.n, self.budget, self.a)) if self.cfg else "")
         if self.a.dry:
             for i, (side, idx) in sorted(self.want.items()):
-                log.info("  [dry] %s %s @ %s", side, self.qty, self.levels[i])
+                log.info("  [dry] %s %s @ %s", side, self.order_qty(i), self.levels[i])
             return
         api(self.s.set_leverage, category=CAT, symbol=self.sym,
             buyLeverage=str(self.lev), sellLeverage=str(self.lev))
@@ -549,12 +599,12 @@ class Grid:
         self.publish()
 
     def check_exit(self, price):
-        if (time.time() - self.t0) / 60 >= self.a.max_minutes:
+        if (time.time() - self.t0) / 60 >= self.hold:
             return "истекло время"
         pnl = self.pnl()
         if self.a.tp_usdt > 0 and pnl >= self.a.tp_usdt:
             return f"тейк-профит {pnl:.2f}$"
-        if self.a.max_loss > 0 and pnl <= -self.a.budget * self.a.max_loss / 100:
+        if self.stop_usdt and pnl <= -self.stop_usdt:
             return f"стоп по убытку {pnl:.2f}$"
         if self.a.exit_er > 0 and time.time() - self.er_checked > 30:
             self.er_checked = time.time()
@@ -694,12 +744,16 @@ def main():
     p.add_argument("--nn-symbols", type=int, default=50, help="монет для учебных сеток")
     p.add_argument("--nn-stride", type=int, default=5, help="шаг (мин) между учебными сетками на последних сутках")
     p.add_argument("--nn-history-days", type=int, default=30, help="дней истории минутных свечей для обучения")
-    p.add_argument("--nn-history-stride", type=int, default=15, help="шаг (мин) между учебными сетками в истории")
+    p.add_argument("--nn-history-stride", type=int, default=20, help="шаг (мин) между учебными сетками в истории")
     p.add_argument("--nn-half-life", type=float, default=7, help="через сколько дней вес примера вдвое меньше")
     p.add_argument("--nn-refresh", type=float, default=30, help="раз в N минут — новые учебные сетки")
     p.add_argument("--nn-retrain-every", type=int, default=500, help="переобучать после N новых примеров")
     p.add_argument("--nn-epochs", type=int, default=60)
     p.add_argument("--nn-max-samples", type=int, default=300000)
+    p.add_argument("--nn-configs", type=int, default=3, help="случайных комбинаций настроек на каждое учебное окно")
+    p.add_argument("--nn-size-min", type=float, default=0.25, help="маржа от нейросети: не меньше X × --budget")
+    p.add_argument("--nn-size-max", type=float, default=2.0, help="маржа от нейросети: не больше X × --budget")
+    p.add_argument("--nn-size-ref", type=float, default=0.1, help="прогноз (%% объёма), при котором маржа = --budget")
     p.add_argument("--nn-path", default=os.getenv("NN_PATH") or ("/data/nn" if os.path.isdir("/data") else "data/nn"))
     # На Railway параметры удобно задавать переменной BOT_ARGS, например:
     #   BOT_ARGS=--budget 30 --leverage 3 --tp-usdt 1
@@ -776,7 +830,17 @@ def main():
             grid = None
             for c in cands:
                 try:
-                    g = Grid(s, a, c, inst[c["symbol"]])
+                    try:
+                        g = Grid(s, a, c, inst[c["symbol"]])
+                    except ValueError as e:
+                        if not c.get("nn_fallback"):
+                            raise
+                        # настройки сети не влезают в минимальный лот биржи — обычные настройки
+                        log.info("%s; беру обычные настройки", e)
+                        fb = c["nn_fallback"]
+                        c = {**c, "cfg": None, "size": 1.0, "grids": fb["levels"],
+                             "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
+                        g = Grid(s, a, c, inst[c["symbol"]])
                     if not a.dry and g.has_position():
                         log.info("%s: уже есть позиция или ордера, пропускаю", c["symbol"])
                         continue

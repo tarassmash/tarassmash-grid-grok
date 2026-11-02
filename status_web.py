@@ -139,8 +139,9 @@ def render_nn(nn):
                      ("реальных сеток ×100", "var(--warn)", [r["real"] * 100 for r in hist])], xlabels=labels)
     preds = "".join(
         f"<tr><td>{escape(x['symbol'])}</td><td>{'—' if x['pred'] is None else '%+.3f%%' % x['pred']}</td>"
-        f"<td>{x['levels']}</td><td>{x['mult']:g}×</td><td class=\"{'pos' if x['take'] else 'neg'}\">{'беру' if x['take'] else 'пропуск'}</td></tr>"
-        for x in nn["preds"]) or '<tr><td colspan="5" class="muted">Прогнозов ещё нет — дождись скана</td></tr>'
+        f"<td>{'%+.3f%%' % x.get('pred_default', 0)}</td><td class=\"cfgcell\">{escape(x.get('cfg', ''))}</td>"
+        f"<td>×{x.get('size', 1):.2f}</td><td class=\"{'pos' if x['take'] else 'neg'}\">{'беру' if x['take'] else 'пропуск'}</td></tr>"
+        for x in nn["preds"]) or '<tr><td colspan="6" class="muted">Прогнозов ещё нет — дождись скана</td></tr>'
     kinds = {"data": ("ДАННЫЕ", "k-data"), "train": ("ОБУЧЕНИЕ", "k-train"), "decide": ("РЕШЕНИЕ", "k-decide"),
              "result": ("ИТОГ СЕТКИ", "k-result"), "plan": ("ПЛАН", "k-plan"), "warn": ("ВНИМАНИЕ", "k-warn")}
     th = "".join(
@@ -167,8 +168,8 @@ def render_nn(nn):
   <div class="panel"><h2>Сколько данных накоплено</h2>{ch3}</div>
   <div class="panel"><h2>План нейросети</h2><ul class="plan">{plan}</ul>
     <h2 style="margin-top:14px">На что она опирается</h2>{imp_html}</div>
-  <div class="panel"><h2>Прогнозы по текущим кандидатам</h2>
-    <div class="scroll"><table><tr><th>Монета</th><th>Прогноз</th><th>Уровней</th><th>Шаг</th><th>Решение</th></tr>{preds}</table></div></div>
+  <div class="panel" style="grid-column:1/-1"><h2>Прогнозы по текущим кандидатам</h2>
+    <div class="scroll"><table><tr><th>Монета</th><th>С настройками сети</th><th>С обычными</th><th>Настройки сети</th><th>Маржа</th><th>Решение</th></tr>{preds}</table></div></div>
 </div>
 <div class="panel"><h2>Мысли нейросети (новое сверху)</h2><div class="thoughts">{th}</div></div>"""
 
@@ -191,7 +192,8 @@ def render():
           <div><span>Диапазон</span><b>{_fmt(g['lower'])} … {_fmt(g['upper'])}</b></div>
           <div><span>Уровней</span><b>{g['levels']}</b></div>
           <div><span>Шаг</span><b>{g['step_pct']:.3f}%</b></div>
-          <div><span>Объём на уровень</span><b>{escape(str(g['qty']))}</b></div>
+          <div><span>Маржа</span><b>{_fmt(g.get('budget'))} $</b></div>
+          <div><span>Средний лот</span><b>{escape(str(g['qty']))}</b></div>
           <div><span>Ордеров открыто</span><b>{g.get('open_orders', '—')}</b></div>
           <div><span>Исполнений</span><b>{g.get('fills', 0)}</b></div>
           <div><span>PnL сетки ≈</span><b class="{'pos' if g.get('profit', 0) >= 0 else 'neg'}">{g.get('profit', 0):.3f} $</b></div>
@@ -200,6 +202,8 @@ def render():
           <div><span>Работает</span><b>{(time.time() - g['started']) / 60:.0f} мин</b></div>
           {f'<div><span>Закрываю лимитками</span><b class="neg">{escape(g["closing"])}</b></div>' if g.get('closing') else ''}
         </div>"""
+        if g.get("cfg"):
+            grid_html += f'<p class="muted small">Настройки от нейросети: {escape(g["cfg"])}</p>'
     else:
         grid_html = '<p class="muted">Сейчас сетки нет — бот ищет монету.</p>'
 
@@ -273,6 +277,7 @@ td:first-child,th:first-child{{text-align:left}}th{{font:600 11px system-ui;colo
 .k-data{{background:#17283a;color:#7cb7f0}}.k-train{{background:#2a2140;color:#b9a2f5}}.k-decide{{background:#1d3a2f;color:var(--pos)}}
 .k-result{{background:#3a3417;color:#f0d36a}}.k-plan{{background:#1f2a26;color:#a8c2b8}}.k-warn{{background:#3a2017;color:var(--warn)}}
 .imp{{display:grid;grid-template-columns:minmax(0,190px) 1fr;gap:10px;align-items:center;font-size:12px;margin:5px 0;color:#c9d6d0}}
+.cfgcell{{font-size:12px;white-space:normal;min-width:220px;text-align:left}}
 .bar{{height:6px;background:var(--line);border-radius:3px;overflow:hidden}}.bar i{{display:block;height:100%;background:var(--acc)}}.small{{font-size:12px;margin:8px 0 0}}
 pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d6d0;white-space:pre-wrap}}
 </style></head><body><div class="wrap">
