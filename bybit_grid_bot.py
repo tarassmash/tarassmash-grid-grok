@@ -30,7 +30,7 @@ Bybit: сканер волатильности + авто нейтральная
   python bybit_grid_bot.py                  # РЕАЛЬНЫЙ счёт (по умолчанию)
   python bybit_grid_bot.py --testnet        # учебный счёт, ключи от testnet.bybit.com
 
-Аккаунт должен быть в One-Way Mode (не Hedge) для USDT perpetual.
+Режим позиций One-Way и Hedge определяется сам.
 Ctrl+C / остановка сервиса: бот снимет ордера и закроет позицию лимитками (до --term-timeout сек).
 """
 
@@ -71,7 +71,8 @@ def D(x):
 
 def round_step(x, step, mode=ROUND_DOWN):
     x, step = D(x), D(step)
-    return (x / step).to_integral_value(rounding=mode) * step
+    # quantize — чтобы в API уходило "10", а не "1E+1"
+    return ((x / step).to_integral_value(rounding=mode) * step).quantize(step)
 
 
 def api(fn, *args, retries=3, **kw):
@@ -180,14 +181,27 @@ def scan(s, inst, a):
 
 # ---------------------------------------------------------------- grid
 
-def position(s, sym):
-    """(сторона, размер, positionIdx) текущей позиции или (None, 0, 0)."""
+def positions(s, sym):
+    """Все открытые ноги позиции: [(сторона, размер, positionIdx)]. В Hedge их может быть две."""
     r = api(s.get_positions, category=CAT, symbol=sym)
+    out = []
     for p in r["result"]["list"]:
         size = D(p.get("size") or 0)
         if size > 0:
-            return p["side"], size, int(p.get("positionIdx") or 0)
-    return None, D(0), 0
+            out.append((p["side"], size, int(p.get("positionIdx") or 0)))
+    return out
+
+
+def position(s, sym):
+    """Первая открытая нога (сторона, размер, positionIdx) или (None, 0, 0)."""
+    legs = positions(s, sym)
+    return legs[0] if legs else (None, D(0), 0)
+
+
+def is_hedge(s, sym):
+    """Режим позиций монеты: в Hedge Bybit отдаёт две записи с positionIdx 1 и 2."""
+    r = api(s.get_positions, category=CAT, symbol=sym)
+    return any(int(p.get("positionIdx") or 0) in (1, 2) for p in r["result"]["list"])
 
 
 def chase_flat(s, sym, ins, a, timeout):
@@ -255,10 +269,11 @@ class Grid:
         # максимум позиции в одну сторону = вся маржа × плечо
         self.max_pos = float(self.qty) * self.n
         self.set_levels(cand["lower"], cand["upper"])
-        self.want = {}      # уровень -> "Buy"/"Sell": что должно стоять
-        self.live = {}      # orderId -> (уровень, сторона)
-        self.net = 0.0      # позиция сетки (+ лонг, − шорт)
-        self.avg = 0.0
+        self.want = {}      # уровень -> (сторона, positionIdx): что должно стоять
+        self.live = {}      # orderId -> (уровень, сторона, positionIdx)
+        self.hedge = False  # режим Hedge: лонг через positionIdx=1, шорт через 2
+        self.long, self.lavg = 0.0, 0.0
+        self.short, self.savg = 0.0, 0.0
         self.realized = 0.0
         self.fills = 0
         self.shifts = 0
@@ -276,61 +291,124 @@ class Grid:
         self.step_price = float(self.levels[-1] - self.levels[0]) / self.n
 
     def layout(self, price):
-        """Buy ниже цены, Sell выше, уровень у цены пустой."""
+        """Buy ниже цены, Sell выше, уровень у цены пустой.
+        Hedge: ближайшие к цене уровни сначала закрывают уже открытую ногу
+        (Buy закрывает шорт, Sell закрывает лонг), остальные открывают новую."""
         empty = min(range(self.n + 1), key=lambda i: abs(float(self.levels[i]) - price))
-        self.want = {i: ("Buy" if i < empty else "Sell") for i in range(self.n + 1) if i != empty}
+        self.want = {}
+        q = float(self.qty)
+        close_short = int(round(self.short / q)) if self.hedge else 0
+        close_long = int(round(self.long / q)) if self.hedge else 0
+        for i in range(empty - 1, -1, -1):          # вниз от цены
+            if not self.hedge:
+                self.want[i] = ("Buy", 0)
+            elif close_short > 0:
+                self.want[i] = ("Buy", 2)
+                close_short -= 1
+            else:
+                self.want[i] = ("Buy", 1)
+        for i in range(empty + 1, self.n + 1):      # вверх от цены
+            if not self.hedge:
+                self.want[i] = ("Sell", 0)
+            elif close_long > 0:
+                self.want[i] = ("Sell", 1)
+                close_long -= 1
+            else:
+                self.want[i] = ("Sell", 2)
+
+    @staticmethod
+    def closes(side, idx):
+        """Ордер закрывает ногу в Hedge: Sell по лонгу (1) или Buy по шорту (2)."""
+        return (side == "Sell" and idx == 1) or (side == "Buy" and idx == 2)
+
+    @property
+    def net(self):
+        return self.long - self.short
 
     # --- учёт позиции и прибыли
-    def book(self, side, px, qty):
-        q = qty if side == "Buy" else -qty
-        if self.net == 0 or (self.net > 0) == (q > 0):
-            tot = abs(self.net) + abs(q)
-            self.avg = (self.avg * abs(self.net) + px * abs(q)) / tot
-            self.net += q
-        else:
-            closing = min(abs(q), abs(self.net))
-            self.realized += (px - self.avg) * closing * (1 if self.net > 0 else -1)
-            self.net += q
-            if abs(self.net) < 1e-12:
-                self.net, self.avg = 0.0, 0.0
-            elif (self.net > 0) == (q > 0):
-                self.avg = px  # позиция перевернулась
+    def book(self, side, idx, px, qty):
+        """Учёт исполнения. One-Way: одна нетто-позиция; Hedge: лонг и шорт отдельно."""
         self.realized -= self.a.fee / 100 * px * qty
+        if idx == 1 or (idx == 0 and side == "Buy" and self.short == 0) or (idx == 0 and side == "Sell" and self.long > 0):
+            leg = "long"
+        else:
+            leg = "short"
+        opening = (side == "Buy") == (leg == "long")
+        if leg == "long":
+            if opening:
+                self.lavg = (self.lavg * self.long + px * qty) / (self.long + qty)
+                self.long += qty
+            else:
+                c = min(qty, self.long)
+                self.realized += (px - self.lavg) * c
+                self.long -= c
+                rest = qty - c
+                if self.long <= 1e-12:
+                    self.long, self.lavg = 0.0, 0.0
+                if rest > 1e-12 and idx == 0:          # One-Way: переворот в шорт
+                    self.short, self.savg = rest, px
+        else:
+            if opening:
+                self.savg = (self.savg * self.short + px * qty) / (self.short + qty)
+                self.short += qty
+            else:
+                c = min(qty, self.short)
+                self.realized += (self.savg - px) * c
+                self.short -= c
+                rest = qty - c
+                if self.short <= 1e-12:
+                    self.short, self.savg = 0.0, 0.0
+                if rest > 1e-12 and idx == 0:          # One-Way: переворот в лонг
+                    self.long, self.lavg = rest, px
 
     def pnl(self):
-        return self.realized + (self.price - self.avg) * self.net
+        return self.realized + (self.price - self.lavg) * self.long + (self.savg - self.price) * self.short
 
     def publish(self):
         web.update(grid={
             "symbol": self.sym, "lower": self.lower, "upper": self.upper, "levels": self.n,
             "step_pct": self.step_price / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
             "open_orders": len(self.live), "fills": self.fills, "profit": self.pnl(),
-            "net": self.net, "shifts": self.shifts, "started": self.t0, "closing": self.closing})
+            "net": (f"L {self.long:g} / S {self.short:g}" if self.hedge else self.net), "shifts": self.shifts, "started": self.t0, "closing": self.closing})
 
     # --- ордера
-    def can_place(self, side):
+    def can_place(self, side, idx):
         """Не даём позиции вырасти больше маржи × плечо, даже если сетка ушла за ценой."""
-        same = sum(1 for _, sd in self.live.values() if sd == side)
         q = float(self.qty)
+        if self.hedge:
+            if self.closes(side, idx):
+                return True
+            same = sum(1 for _, sd, ix in self.live.values() if sd == side and ix == idx)
+            cur = self.long if idx == 1 else self.short
+            return cur + q * (same + 1) <= self.max_pos * 1.0001
+        same = sum(1 for _, sd, _ix in self.live.values() if sd == side)
         proj = (self.net if side == "Buy" else -self.net) + q * (same + 1)
         return proj <= self.max_pos * 1.0001
 
-    def place(self, i, side):
+    def place(self, i, side, idx):
         if self.a.dry:
             return
+        kw = {}
+        if self.closes(side, idx):
+            kw["reduceOnly"] = True
         try:
             r = api(self.s.place_order, category=CAT, symbol=self.sym, side=side, orderType="Limit",
-                    qty=str(self.qty), price=str(self.levels[i]), timeInForce="GTC", positionIdx=0)
-            self.live[r["result"]["orderId"]] = (i, side)
+                    qty=str(self.qty), price=str(self.levels[i]), timeInForce="GTC", positionIdx=idx, **kw)
+            self.live[r["result"]["orderId"]] = (i, side, idx)
         except Exception as e:  # noqa: BLE001
-            log.error("%s: не удалось поставить %s @ %s: %s", self.sym, side, self.levels[i], e)
+            msg = str(e)
+            if self.closes(side, idx) and ("110017" in msg or "reduce" in msg.lower()):
+                # закрывать нечего (нога уже 0) — уровень переводим на открытие
+                self.want[i] = (side, 2 if side == "Sell" else 1)
+                return
+            log.error("%s: не удалось поставить %s @ %s: %s", self.sym, side, self.levels[i], msg)
 
     def refill(self):
         """Поставить всё, чего не хватает в сетке (после исполнения, сдвига, снятия)."""
-        placed = {i for i, _ in self.live.values()}
-        for i, side in sorted(self.want.items()):
-            if i not in placed and self.can_place(side):
-                self.place(i, side)
+        placed = {i for i, _, _ in self.live.values()}
+        for i, (side, idx) in sorted(self.want.items()):
+            if i not in placed and self.can_place(side, idx):
+                self.place(i, side, idx)
 
     def order_info(self, oid):
         r = api(self.s.get_order_history, category=CAT, symbol=self.sym, orderId=oid)
@@ -339,20 +417,22 @@ class Grid:
 
     def on_done(self, oid, info):
         """Ордер сетки ушёл из открытых: исполнен -> встречный на соседний уровень."""
-        i, side = self.live.pop(oid)
+        i, side, idx = self.live.pop(oid)
         st = info["orderStatus"]
         done = float(info.get("cumExecQty") or 0)
         if done > 0:
-            self.book(side, float(info.get("avgPrice") or self.levels[i]), done)
+            self.book(side, idx, float(info.get("avgPrice") or self.levels[i]), done)
         if st == "Filled":
             self.fills += 1
             self.want.pop(i, None)
+            # встречная лимитка на соседний уровень, по той же ноге (positionIdx)
             if side == "Buy" and i + 1 <= self.n:
-                self.want[i + 1] = "Sell"
+                self.want[i + 1] = ("Sell", idx)
             elif side == "Sell" and i - 1 >= 0:
-                self.want[i - 1] = "Buy"
-            log.info("%s: исполнен %s @ %s | позиция %.6g | PnL≈%.3f$",
-                     self.sym, side, self.levels[i], self.net, self.pnl())
+                self.want[i - 1] = ("Buy", idx)
+            pos = f"L {self.long:g} / S {self.short:g}" if self.hedge else f"{self.net:g}"
+            log.info("%s: исполнен %s @ %s | позиция %s | PnL≈%.3f$",
+                     self.sym, side, self.levels[i], pos, self.pnl())
 
     def sync(self):
         r = api(self.s.get_open_orders, category=CAT, symbol=self.sym, limit=50)
@@ -403,11 +483,14 @@ class Grid:
 
     # --- запуск / выход
     def start(self, price):
+        if not self.a.dry:
+            self.hedge = is_hedge(self.s, self.sym)
+            log.info("%s: режим позиций %s", self.sym, "Hedge" if self.hedge else "One-Way")
         self.layout(price)
         log.info("СЕТКА %s: %s … %s, уровней %d, шаг %.3f%%, qty %s, плечо %sx",
                  self.sym, self.lower, self.upper, self.n, self.step_price / price * 100, self.qty, self.lev)
         if self.a.dry:
-            for i, side in sorted(self.want.items()):
+            for i, (side, idx) in sorted(self.want.items()):
                 log.info("  [dry] %s %s @ %s", side, self.qty, self.levels[i])
             return
         api(self.s.set_leverage, category=CAT, symbol=self.sym,
@@ -455,7 +538,7 @@ class Grid:
 
     def has_position(self):
         """Есть ли уже позиция или ордера на этой монете (например, от другого бота на счёте)."""
-        if position(self.s, self.sym)[1] > 0:
+        if positions(self.s, self.sym):
             return True
         o = api(self.s.get_open_orders, category=CAT, symbol=self.sym, limit=1)
         return bool(o["result"]["list"])
