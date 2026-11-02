@@ -361,6 +361,13 @@ def balance(s):
     return bal
 
 
+def pause_wait(sec):
+    """Ждать sec секунд, но выйти сразу, если нажали «Стоп»."""
+    end = time.time() + sec
+    while time.time() < end and not web.CONTROL["paused"]:
+        time.sleep(1)
+
+
 def wait_forever(msg):
     """Фатальная ошибка: не выходим (иначе пропадёт страница), показываем её и ждём."""
     log.error(msg)
@@ -434,6 +441,12 @@ def main():
     grid = None
     try:
         while True:
+            if web.CONTROL["paused"]:
+                web.update(state="на паузе — нажми «Старт» на странице")
+                if web.CONTROL["msg"].startswith("Остановка"):
+                    web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиция закрыта"
+                time.sleep(1)
+                continue
             web.update(state="сканирую рынок", error="")
             try:
                 cands = scan(s, inst, a)
@@ -441,6 +454,8 @@ def main():
                 log.error("Ошибка скана: %s", e)
                 web.update(error="Ошибка скана: %s" % e)
                 time.sleep(30)
+                continue
+            if web.CONTROL["paused"]:
                 continue
             now = time.time()
             cands = [c for c in cands if cooldown.get(c["symbol"], 0) < now]
@@ -458,7 +473,7 @@ def main():
             if not grid:
                 log.info("Подходящих пар нет, жду 60 сек")
                 web.update(state="подходящих монет нет, жду")
-                time.sleep(60)
+                pause_wait(60)
                 continue
 
             web.update(state="ставлю сетку " + grid.sym)
@@ -467,11 +482,18 @@ def main():
             if a.dry:
                 cooldown[grid.sym] = now + a.cooldown * 60
                 grid = None
-                time.sleep(60)
+                pause_wait(60)
                 continue
 
             while True:
                 time.sleep(a.poll)
+                if web.CONTROL["paused"]:
+                    try:
+                        grid.close("стоп со страницы")
+                    except Exception as e:  # noqa: BLE001
+                        log.error("Ошибка закрытия: %s — повтор", e)
+                        continue
+                    break
                 try:
                     grid.sync()
                     reason = grid.check_exit()

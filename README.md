@@ -14,6 +14,8 @@
 | `BYBIT_API_KEY` | ключ API |
 | `BYBIT_API_SECRET` | секрет API |
 | `BOT_ARGS` | параметры бота, например `--budget 30 --leverage 3 --tp-usdt 1` |
+| `CONTROL_KEY` | (рекомендуется) пароль для кнопок «Старт/Стоп» на странице, иначе их может нажать любой, у кого есть ссылка |
+| `START_PAUSED` | `1` — после перезапуска бот ждёт нажатия «Старт» |
 | `HTTPS_PROXY` | (если Bybit блокирует IP Railway) `socks5://user:pass@host:port` или `http://…` |
 
 4. **Settings → Networking → Generate Domain**: появится ссылка на страницу бота
