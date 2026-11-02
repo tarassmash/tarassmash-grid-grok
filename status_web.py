@@ -78,7 +78,10 @@ def svg_chart(series, w=560, h=190, xlabels=None, unit="", zero=False):
             return f"{v / 1e6:.1f}M"
         if a >= 1e3:
             return f"{v / 1e3:.1f}k"
-        return f"{v:.3g}"
+        if a >= 100:
+            return f"{v:.0f}"
+        t = f"{v:.3f}".rstrip("0").rstrip(".")
+        return "0" if t in ("-0", "") else t
     n = max(len(ys) for _, _, ys in series)
     X = lambda i: pad_l + (w - pad_l - pad_r) * (i / max(n - 1, 1))  # noqa: E731
     Y = lambda v: pad_t + (h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))  # noqa: E731
