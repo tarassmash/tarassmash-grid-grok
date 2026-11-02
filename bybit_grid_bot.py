@@ -691,12 +691,15 @@ def main():
     # нейросеть
     p.add_argument("--no-nn", dest="nn", action="store_false", help="не давать нейросети принимать решения (учится всё равно)")
     p.add_argument("--nn-min-edge", type=float, default=0.02, help="брать сетку, если прогноз выше X %% от объёма")
-    p.add_argument("--nn-symbols", type=int, default=30, help="монет для учебных сеток")
-    p.add_argument("--nn-stride", type=int, default=5, help="шаг (мин) между учебными сетками")
-    p.add_argument("--nn-refresh", type=float, default=60, help="раз в N минут — новые учебные сетки")
+    p.add_argument("--nn-symbols", type=int, default=50, help="монет для учебных сеток")
+    p.add_argument("--nn-stride", type=int, default=5, help="шаг (мин) между учебными сетками на последних сутках")
+    p.add_argument("--nn-history-days", type=int, default=30, help="дней истории минутных свечей для обучения")
+    p.add_argument("--nn-history-stride", type=int, default=15, help="шаг (мин) между учебными сетками в истории")
+    p.add_argument("--nn-half-life", type=float, default=7, help="через сколько дней вес примера вдвое меньше")
+    p.add_argument("--nn-refresh", type=float, default=30, help="раз в N минут — новые учебные сетки")
     p.add_argument("--nn-retrain-every", type=int, default=500, help="переобучать после N новых примеров")
     p.add_argument("--nn-epochs", type=int, default=60)
-    p.add_argument("--nn-max-samples", type=int, default=60000)
+    p.add_argument("--nn-max-samples", type=int, default=300000)
     p.add_argument("--nn-path", default=os.getenv("NN_PATH") or ("/data/nn" if os.path.isdir("/data") else "data/nn"))
     # На Railway параметры удобно задавать переменной BOT_ARGS, например:
     #   BOT_ARGS=--budget 30 --leverage 3 --tp-usdt 1

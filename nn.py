@@ -2,7 +2,9 @@
 
 Откуда данные:
   1) учебные сетки — бот сам прогоняет свою сетку по минутным свечам ликвидных монет
-     (те же правила: сдвиг за ценой, лимит позиции, стоп по убытку, комиссии), каждый час на свежих свечах;
+     (те же правила: сдвиг за ценой, лимит позиции, стоп по убытку, комиссии): при первом запуске —
+     по истории за --nn-history-days дней (кэш на диске), дальше — по новым свечам каждые --nn-refresh минут;
+     свежие примеры весят больше старых (вес вдвое меньше каждые --nn-half-life дней);
   2) реальные сетки — каждая закрытая сетка на бирже, с весом ×3.
 
 Что предсказывает: доходность сетки в % от объёма позиции (не зависит от маржи и плеча) за --max-minutes.
@@ -173,8 +175,10 @@ class MLP:
     def predict(self, X):
         return self.forward(X)[-1][:, 0]
 
-    def fit(self, X, y, w, Xv, yv, epochs=60, lr=2e-3, batch=256, l2=1e-4, delta=1.0, seed=0, on_epoch=None):
-        """Adam + Huber loss. Возвращает кривые ошибки по эпохам; оставляет лучшие по проверке веса."""
+    def fit(self, X, y, w, Xv, yv, epochs=60, lr=2e-3, batch=256, l2=5e-4, delta=1.0, seed=0, on_epoch=None,
+            patience=12):
+        """Adam + Huber loss. Возвращает кривые ошибки по эпохам; оставляет лучшие по проверке веса.
+        Ранняя остановка: если проверка не улучшалась `patience` эпох — дальше не учимся (это заучивание шума)."""
         rng = np.random.default_rng(seed)
         params = self.W + self.b
         m = [np.zeros_like(p) for p in params]
@@ -182,6 +186,7 @@ class MLP:
         t = 0
         curve = []
         best = (float("inf"), None)
+        since_best = 0
 
         def huber(pred, target, wt):
             r = pred - target
@@ -214,8 +219,13 @@ class MLP:
             curve.append({"epoch": ep + 1, "train": tl, "val": vl})
             if vl < best[0]:
                 best = (vl, ([W.copy() for W in self.W], [b.copy() for b in self.b]))
+                since_best = 0
+            else:
+                since_best += 1
             if on_epoch:
                 on_epoch(ep + 1, epochs)
+            if patience and since_best >= patience:
+                break
         if best[1]:
             self.W, self.b = best[1]
         return curve
@@ -237,13 +247,22 @@ class Brain:
     def __init__(self, path, a, market, analyze_fn, klines_fn, symbols_fn):
         self.path = path
         self.a = a
-        self.market = market            # HTTP-клиент для рыночных данных
+        self.market = market            # HTTP-клиент для рыночных данных (pybit, реальный рынок)
         self.analyze = analyze_fn
-        self.klines = klines_fn         # klines(session, sym, n) -> [[t,o,h,l,c,v,turnover], ...] от старых к новым
+        self.klines = klines_fn
         self.symbols = symbols_fn       # () -> список ликвидных монет
-        self.lock = threading.Lock()
-        self.X, self.y, self.w, self.t, self.kind = [], [], [], [], []   # kind: 0 учебная, 1 реальная
-        self.seen = {}                  # "SYM:время свечи" -> время, чтобы не учить одно и то же дважды
+        self.lock = threading.RLock()
+        nf = len(FEATURES)
+        # данные в numpy: сотни тысяч примеров занимают десятки МБ, а не гигабайты
+        self.X = np.zeros((0, nf), np.float32)
+        self.y = np.zeros(0, np.float32)
+        self.w = np.zeros(0, np.float32)
+        self.t = np.zeros(0, np.float64)
+        self.kind = np.zeros(0, np.int8)            # 0 учебная, 1 реальная
+        self._buf = []
+        self.covered = {}               # монета -> время последней разобранной учебной сетки
+        self.hist_dir = os.path.join(path, "hist")
+        self.hist = {"symbols": 0, "candles": 0, "days": 0.0}
         self.model, self.mu, self.sd = None, None, None
         self.active = False
         self.history = []               # запуски обучения
@@ -254,26 +273,57 @@ class Brain:
         self.last_train_n = 0
         self.preds = []                 # прогнозы по последним кандидатам
         self.thoughts = collections.deque(maxlen=400)   # журнал мыслей: что делает, почему, что дальше
-        self.importance = []            # какие признаки важнее (после обучения)
+        self.importance = []
         self._last_decision = ("", 0.0)
-        os.makedirs(path, exist_ok=True)
+        os.makedirs(self.hist_dir, exist_ok=True)
         self.load()
 
-    # --- сохранение
+    # --- хранение
+    def n(self):
+        return len(self.y) + len(self._buf)
+
+    def _flush(self):
+        with self.lock:
+            if not self._buf:
+                return
+            xs, ys, ws, ts, ks = zip(*self._buf)
+            self._buf = []
+            self.X = np.concatenate([self.X, np.array(xs, np.float32)])
+            self.y = np.concatenate([self.y, np.array(ys, np.float32)])
+            self.w = np.concatenate([self.w, np.array(ws, np.float32)])
+            self.t = np.concatenate([self.t, np.array(ts, np.float64)])
+            self.kind = np.concatenate([self.kind, np.array(ks, np.int8)])
+
+    def _trim(self):
+        """Оставляем самые свежие --nn-max-samples примеров; реальные сетки не выбрасываем никогда."""
+        with self.lock:
+            cap = self.a.nn_max_samples
+            if len(self.y) <= cap:
+                return
+            real = np.where(self.kind == 1)[0]
+            other = np.where(self.kind != 1)[0]
+            keep_other = other[np.argsort(self.t[other])][-(cap - len(real)):]
+            keep = np.sort(np.concatenate([real, keep_other]))
+            self.X, self.y, self.w, self.t, self.kind = (self.X[keep], self.y[keep], self.w[keep],
+                                                         self.t[keep], self.kind[keep])
+
     def save(self):
         try:
+            self._flush()
             with self.lock:
-                data = {"X": self.X[-self.a.nn_max_samples:], "y": self.y[-self.a.nn_max_samples:],
-                        "w": self.w[-self.a.nn_max_samples:], "t": self.t[-self.a.nn_max_samples:],
-                        "kind": self.kind[-self.a.nn_max_samples:], "history": self.history[-300:],
-                        "curve": self.curve, "active": self.active,
+                tmp = os.path.join(self.path, "data.npz.tmp")
+                with open(tmp, "wb") as f:
+                    np.savez_compressed(f, X=self.X, y=self.y, w=self.w, t=self.t, kind=self.kind)
+                os.replace(tmp, os.path.join(self.path, "data.npz"))
+                meta = {"history": self.history[-300:], "curve": self.curve, "active": self.active,
                         "model": self.model.to_json() if self.model else None,
                         "mu": self.mu.tolist() if self.mu is not None else None,
                         "sd": self.sd.tolist() if self.sd is not None else None, "features": FEATURES,
-                        "seen": self.seen, "thoughts": list(self.thoughts)[:200], "importance": self.importance}
+                        "covered": self.covered, "thoughts": list(self.thoughts)[:200],
+                        "importance": self.importance, "last_train_n": self.last_train_n, "hist": self.hist}
             tmp = os.path.join(self.path, "brain.json.tmp")
             with open(tmp, "w") as f:
-                json.dump(data, f)
+                json.dump(meta, f)
             os.replace(tmp, os.path.join(self.path, "brain.json"))
         except Exception as e:  # noqa: BLE001
             log.warning("Нейросеть: не сохранилась: %s", e)
@@ -282,23 +332,35 @@ class Brain:
         try:
             with open(os.path.join(self.path, "brain.json")) as f:
                 d = json.load(f)
-            if d.get("features") != FEATURES:
-                log.info("Нейросеть: признаки изменились — начинаю обучение заново")
-                return
-            self.X, self.y, self.w, self.t, self.kind = d["X"], d["y"], d["w"], d["t"], d["kind"]
+        except FileNotFoundError:
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("Нейросеть: файл не прочитан: %s", e)
+            return
+        if d.get("features") != FEATURES:
+            log.info("Нейросеть: признаки изменились — начинаю обучение заново")
+            return
+        try:
+            if "X" in d:      # старый формат (списки в JSON) — переносим
+                self.X = np.array(d["X"], np.float32).reshape(-1, len(FEATURES))
+                self.y, self.w = np.array(d["y"], np.float32), np.array(d["w"], np.float32)
+                self.t, self.kind = np.array(d["t"], np.float64), np.array(d["kind"], np.int8)
+            elif os.path.exists(os.path.join(self.path, "data.npz")):
+                z = np.load(os.path.join(self.path, "data.npz"))
+                self.X, self.y, self.w, self.t, self.kind = z["X"], z["y"], z["w"], z["t"], z["kind"]
             self.history, self.curve, self.active = d.get("history", []), d.get("curve", []), d.get("active", False)
             if d.get("model"):
                 self.model = MLP.from_json(d["model"])
                 self.mu, self.sd = np.array(d["mu"]), np.array(d["sd"])
-            self.seen = d.get("seen") or {}
+            self.covered = d.get("covered") or {}
             self.thoughts.extend(d.get("thoughts") or [])
             self.importance = d.get("importance") or []
+            self.last_train_n = d.get("last_train_n", len(self.y))
+            self.hist = d.get("hist") or self.hist
             self.status_text = f"загружено {len(self.y)} примеров"
             log.info("Нейросеть: загружено %d примеров, модель %s", len(self.y), "активна" if self.active else "учится")
-        except FileNotFoundError:
-            pass
         except Exception as e:  # noqa: BLE001
-            log.warning("Нейросеть: файл не прочитан: %s", e)
+            log.warning("Нейросеть: данные не прочитаны (%s) — начинаю заново", e)
 
     # --- мысли
     def think(self, kind, title, lines=None):
@@ -322,10 +384,12 @@ class Brain:
 
     def plan_lines(self):
         nxt_boot = self.last_boot + self.a.nn_refresh * 60
-        need = max(0, self.a.nn_retrain_every - (len(self.y) - self.last_train_n))
+        need = max(0, self.a.nn_retrain_every - (self.n() - self.last_train_n))
         out = [f"Следующий сбор учебных сеток: ~{time.strftime('%H:%M UTC', time.gmtime(nxt_boot))}"
                if self.last_boot else "Сбор учебных сеток: сейчас",
-               f"Переобучение: после ещё {need} новых примеров (обычно сразу после сбора)"]
+               f"Переобучение: после ещё {need} новых примеров (обычно сразу после сбора)",
+               f"История: {self.hist.get('symbols', 0)} монет, {self.hist.get('days', 0):.0f} дн. минутных свечей; "
+               f"свежие дни важнее старых (вес вдвое меньше каждые {self.a.nn_half_life:g} дн.)"]
         if not self.active:
             out.append("Чтобы включиться, мои сетки на проверке должны быть в плюсе и лучше всех сеток сканера, "
                        "и таких сеток должно быть не меньше 30")
@@ -336,72 +400,141 @@ class Brain:
     # --- данные
     def add(self, feats, target, kind, t_ms, weight):
         with self.lock:
-            self.X.append(vec(feats))
-            self.y.append(float(max(-10.0, min(10.0, target))))
-            self.w.append(float(weight))
-            self.t.append(float(t_ms))
-            self.kind.append(kind)
+            self._buf.append((vec(feats), float(max(-10.0, min(10.0, target))), float(weight), float(t_ms), kind))
 
     def add_real(self, feats, target, pred=None, sym=""):
         """Закрытая сетка на бирже: доходность в % от объёма позиции."""
-        if feats:
-            self.add(feats, target, 1, time.time() * 1000, 3.0)
-            lines = [f"Итог: {target:+.3f}% от объёма позиции"]
-            if pred is not None:
-                err = target - pred
-                lines.append(f"Мой прогноз был {pred:+.3f}% — ошиблась на {err:+.3f}% "
-                             + ("(оказалось лучше, чем думала)" if err > 0 else "(оказалось хуже, чем думала)"))
-            else:
-                lines.append("Прогноза не было — сетку выбрал сканер, пока я училась")
-            n_real = sum(1 for k in self.kind if k == 1)
-            lines.append(f"Запомнила с весом ×3. Реальных сеток в памяти: {n_real}")
-            self.think("result", f"{sym}: разбираю закрытую реальную сетку", lines)
-            self.save()
+        if not feats:
+            return
+        self.add(feats, target, 1, time.time() * 1000, 3.0)
+        lines = [f"Итог: {target:+.3f}% от объёма позиции"]
+        if pred is not None:
+            err = target - pred
+            lines.append(f"Мой прогноз был {pred:+.3f}% — ошиблась на {err:+.3f}% "
+                         + ("(оказалось лучше, чем думала)" if err > 0 else "(оказалось хуже, чем думала)"))
+        else:
+            lines.append("Прогноза не было — сетку выбрал сканер, пока я училась")
+        self._flush()
+        lines.append(f"Запомнила с весом ×3. Реальных сеток в памяти: {int((self.kind == 1).sum())}")
+        self.think("result", f"{sym}: разбираю закрытую реальную сетку", lines)
+        self.save()
+
+    def _kline_page(self, sym, start, end):
+        for i in range(4):
+            try:
+                r = self.market.get_kline(category="linear", symbol=sym, interval="1", limit=1000,
+                                          start=int(start), end=int(end))
+                return r["result"]["list"]
+            except Exception as e:  # noqa: BLE001
+                if i == 3:
+                    raise
+                log.warning("Нейросеть: свечи %s (%s), повтор", sym, str(e)[:100])
+                time.sleep(1.5 * (i + 1))
+
+    def _fetch(self, sym, start, end):
+        """Минутные свечи [start, end] постранично (Bybit отдаёт до 1000 за раз, новые первыми)."""
+        rows = []
+        while end >= start:
+            lst = self._kline_page(sym, start, end)
+            if not lst:
+                break
+            rows.extend(lst)
+            oldest = int(lst[-1][0])
+            if oldest <= start or len(lst) < 1000:
+                break
+            end = oldest - 1
+            time.sleep(0.04)
+        if not rows:
+            return np.zeros((0, 7))
+        return np.array([[float(x) for x in k[:7]] for k in rows])
+
+    def candles(self, sym):
+        """Свечи монеты за --nn-history-days: кэш на диске + докачка недостающего. Массив (n, 7) от старых к новым."""
+        f = os.path.join(self.hist_dir, sym + ".npy")
+        now = time.time() * 1000
+        start = now - self.a.nn_history_days * 86_400_000
+        arr = np.load(f) if os.path.exists(f) else np.zeros((0, 7))
+        arr = arr[arr[:, 0] >= start] if len(arr) else arr
+        parts = [arr]
+        if not len(arr) or arr[0, 0] > start + 3_600_000:          # не хватает старой истории
+            parts.append(self._fetch(sym, start, (arr[0, 0] - 1) if len(arr) else now))
+        if len(arr):                                                 # докачка новых свечей
+            parts.append(self._fetch(sym, arr[-1, 0] + 60_000, now))
+        arr = np.concatenate([p for p in parts if len(p)]) if any(len(p) for p in parts) else np.zeros((0, 7))
+        if len(arr):
+            _, idx = np.unique(arr[:, 0], return_index=True)
+            arr = arr[idx]
+            arr = arr[arr[:, 0] + 60_000 <= now]                     # только закрытые свечи
+        np.save(f, arr)
+        return arr
 
     def bootstrap(self):
-        """Учебные сетки по свежим минутным свечам ликвидных монет."""
+        """Учебные сетки по минутным свечам: при первом запуске — вся история за --nn-history-days,
+        дальше — только новые свечи. Возвращает число новых примеров."""
         a = self.a
         syms = self.symbols()[: a.nn_symbols]
-        added = 0
+        H = min(HORIZON_MIN, int(a.max_minutes))
         win = a.window + 1
-        self.think("data", f"Собираю учебные сетки по {len(syms)} монетам",
-                   [f"Беру последние 1000 минутных свечей: {', '.join(s.replace('USDT', '') for s in syms[:12])}"
-                    + (" и др." if len(syms) > 12 else ""),
-                    f"Каждые {a.nn_stride} мин. мысленно ставлю 3 сетки (частую, обычную, редкую) и смотрю, "
-                    f"что было бы через {min(HORIZON_MIN, int(a.max_minutes))} мин. по правилам бота"])
-        n0 = len(self.y)
+        first = not self.covered
+        if first:
+            self.think("data", f"Загружаю историю: {a.nn_history_days} дн. минутных свечей по {len(syms)} монетам",
+                       ["Первая загрузка займёт несколько минут — Bybit отдаёт по 1000 свечей за запрос",
+                        f"По истории ставлю учебную сетку каждые {a.nn_history_stride} мин., по последним суткам — "
+                        f"каждые {a.nn_stride} мин.; на каждую — 3 варианта шага, итог через {H} мин."])
+        else:
+            self.think("data", f"Дочитываю новые свечи по {len(syms)} монетам",
+                       [f"Учебная сетка каждые {a.nn_stride} мин. свежего рынка, 3 варианта шага, итог через {H} мин."])
+        n0 = self.n()
+        now = time.time() * 1000
+        total_candles, oldest = 0, now
         for si, sym in enumerate(syms):
-            self.progress = f"учебные сетки: {sym} ({si + 1}/{len(syms)})"
+            self.progress = f"{'история' if first else 'новые свечи'}: {sym} ({si + 1}/{len(syms)})"
             try:
-                kl = self.klines(self.market, sym, 1000)
+                KL = self.candles(sym)
             except Exception as e:  # noqa: BLE001
                 log.warning("Нейросеть: свечи %s: %s", sym, e)
                 continue
-            for end in range(win, len(kl) - HORIZON_MIN, a.nn_stride):
-                key = f"{sym}:{int(float(kl[end - 1][0]))}"
-                if key in self.seen:
+            n = len(KL)
+            total_candles += n
+            if n:
+                oldest = min(oldest, KL[0, 0])
+            if n < win + H:
+                continue
+            tm = KL[:, 0]
+            last = self.covered.get(sym, 0)
+            for end in range(win, n - H + 1):
+                t_end = tm[end - 1]
+                if t_end <= last:
                     continue
-                self.seen[key] = float(kl[end - 1][0])
-                window = kl[end - win:end]
+                stride = a.nn_stride if now - t_end < 86_400_000 else a.nn_history_stride
+                if int(t_end // 60_000) % stride:
+                    continue
+                if tm[end + H - 1] - tm[end - win] != (win + H - 1) * 60_000:
+                    continue                                         # дыра в свечах — пропускаем
+                window = KL[end - win:end]
                 m = self.analyze(window, a)
                 if not m or m["vol1m"] < a.min_1m * 0.3:
                     continue
                 base = base_features(window, m)
-                fut = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in kl[end:end + min(HORIZON_MIN, int(a.max_minutes))]]
+                fut = KL[end:end + H, 1:5]
                 for mult in MULTS:
                     f, levels = variant(base, mult, a.max_levels)
                     r = simulate_grid(fut, m["price"], m["lower"], m["upper"], levels, a.fee, a.leverage,
                                       a.max_loss, a.shift_steps)
-                    self.add(f, r, 0, float(kl[end - 1][0]), 1.0)
-                    added += 1
-        old = time.time() * 1000 - 2 * 86_400_000
-        self.seen = {k: v for k, v in self.seen.items() if v >= old}
+                    self.add(f, r, 0, t_end, 1.0)
+            self.covered[sym] = max(last, float(tm[n - H]))
+        self.hist = {"symbols": len(syms), "candles": int(total_candles), "days": (now - oldest) / 86_400_000}
+        self._flush()
+        self._trim()
         self.last_boot = time.time()
-        if added:
+        added = self.n() - n0
+        if added > 0:
             with self.lock:
-                Xn = np.array(self.X[n0:], dtype=float)
-                yn = np.array(self.y[n0:], dtype=float)
-            lines = [f"Новых примеров: {added}. Прибыльных: {(yn > 0).mean() * 100:.0f}%, средний итог {yn.mean():+.3f}%"]
+                yn = self.y[-added:].astype(float)
+                Xn = self.X[-added:].astype(float)
+            lines = [f"Новых примеров: {added:,}. Прибыльных: {(yn > 0).mean() * 100:.0f}%, средний итог {yn.mean():+.3f}%"]
+            if first:
+                lines.insert(0, f"История: {total_candles:,} минутных свечей за {self.hist['days']:.0f} дн.")
             mcol = Xn[:, FEATURES.index("mult")]
             best = None
             for mlt in MULTS:
@@ -415,35 +548,35 @@ class Brain:
             if len(lo) and len(hi):
                 lines.append(f"Боковик (ER < 0.3): {lo.mean():+.3f}%, трендовее (ER ≥ 0.3): {hi.mean():+.3f}%")
             if best:
-                lines.append(f"На свежем рынке лучше всего шла {MULT_RU[best[0]]} сетка")
-            self.think("data", "Учебные сетки собраны", lines)
+                lines.append(f"Лучше всего шла {MULT_RU[best[0]]} сетка")
+            lines.append(f"Всего в памяти: {self.n():,} примеров")
+            self.think("data", "История загружена" if first else "Учебные сетки собраны", lines)
         else:
-            self.think("data", "Новых учебных сеток нет", ["Свечи с прошлого сбора уже разобраны — жду новых"])
-        with self.lock:
-            if len(self.y) > a.nn_max_samples:
-                cut = len(self.y) - a.nn_max_samples
-                for arr in (self.X, self.y, self.w, self.t, self.kind):
-                    del arr[:cut]
+            self.think("data", "Новых учебных сеток нет", ["Новые свечи ещё не накопились — жду"])
         return added
 
     # --- обучение
     def train(self):
+        self._flush()
         with self.lock:
-            X = np.array(self.X, dtype=float)
-            y = np.array(self.y, dtype=float)
-            w = np.array(self.w, dtype=float)
-            t = np.array(self.t, dtype=float)
-            kind = np.array(self.kind)
+            X = self.X.astype(float)
+            y = self.y.astype(float)
+            w = self.w.astype(float)
+            t = self.t.copy()
+            kind = self.kind.copy()
         if len(y) < 300:
             self.status_text = f"мало данных ({len(y)} примеров), жду"
             self.think("plan", "Мало данных для обучения", [f"Есть {len(y)} примеров, нужно хотя бы 300"] + self.plan_lines())
             return
         self.think("train", f"Начинаю обучение №{len(self.history) + 1}",
-                   [f"Примеров: {len(y)}, из них реальных сеток: {int((np.array(self.kind) == 1).sum())}",
-                    f"Самые свежие 20% отложу для проверки — их я не увижу при обучении",
-                    f"{self.a.nn_epochs} проходов по данным, оставлю версию с лучшей проверкой"])
+                   [f"Примеров: {len(y):,}, из них реальных сеток: {int((kind == 1).sum())}",
+                    "Самые свежие 20% по времени отложу для проверки — их я не увижу при обучении",
+                    f"Свежие примеры важнее: вес вдвое меньше каждые {self.a.nn_half_life:g} дн.",
+                    f"До {self.a.nn_epochs} проходов; остановлюсь раньше, если проверка 12 проходов не улучшается"])
         order = np.argsort(t, kind="stable")
-        X, y, w, kind = X[order], y[order], w[order], kind[order]
+        X, y, w, t, kind = X[order], y[order], w[order], t[order], kind[order]
+        age_days = (t.max() - t) / 86_400_000
+        w = w * np.maximum(0.1, 0.5 ** (age_days / max(self.a.nn_half_life, 0.1)))
         n_val = max(100, int(len(y) * 0.2))
         Xt, yt, wt = X[:-n_val], y[:-n_val], w[:-n_val]
         Xv, yv = X[-n_val:], y[-n_val:]
@@ -452,10 +585,11 @@ class Brain:
 
         def prog(ep, n):
             self.progress = f"обучение: эпоха {ep}/{n}"
-        curve = model.fit((Xt - mu) / sd, yt, wt, (Xv - mu) / sd, yv, epochs=self.a.nn_epochs, on_epoch=prog)
+        batch = 256 if len(yt) < 50_000 else 1024
+        curve = model.fit((Xt - mu) / sd, yt, wt, (Xv - mu) / sd, yv, epochs=self.a.nn_epochs, batch=batch,
+                          on_epoch=prog)
         pv = model.predict((Xv - mu) / sd)
-        # проверка на свежих данных: сравниваем отбор сети с «брать всё, что дал сканер»
-        # (в один момент по монете 3 варианта шага — считаем лучший прогноз каждой группы)
+        # проверка на свежих данных: отбор сети против «брать всё, что дал сканер»
         sel = pv > self.a.nn_min_edge
         base_avg = float(yv[np.isclose(Xv[:, FEATURES.index("mult")], 1.0)].mean()) if len(yv) else 0.0
         sel_avg = float(yv[sel].mean()) if sel.any() else 0.0
@@ -463,19 +597,23 @@ class Brain:
         active = bool(sel.sum() >= 30 and sel_avg > 0 and sel_avg > base_avg)
         # важность признаков: насколько растёт ошибка, если перемешать признак на проверке
         Zv = (Xv - mu) / sd
-        base_err = float(np.mean(np.abs(model.predict(Zv) - yv)))
+        if len(Zv) > 20000:
+            Zv, yvi = Zv[-20000:], yv[-20000:]
+        else:
+            yvi = yv
+        base_err = float(np.mean(np.abs(model.predict(Zv) - yvi)))
         rng = np.random.default_rng(1)
         imp = []
         for k in range(len(FEATURES)):
             Zs = Zv.copy()
             Zs[:, k] = rng.permutation(Zs[:, k])
-            imp.append((FEATURES[k], float(np.mean(np.abs(model.predict(Zs) - yv)) - base_err)))
+            imp.append((FEATURES[k], float(np.mean(np.abs(model.predict(Zs) - yvi)) - base_err)))
         imp.sort(key=lambda x: -x[1])
         run = {
             "time": int(time.time() * 1000), "samples": int(len(y)), "real": int((kind == 1).sum()),
             "train_loss": curve[-1]["train"], "val_loss": min(c["val"] for c in curve), "corr": corr,
             "sel_avg": sel_avg, "base_avg": base_avg, "sel_n": int(sel.sum()), "val_n": int(len(yv)),
-            "sel_share": float(sel.mean()) if len(yv) else 0.0, "active": active,
+            "sel_share": float(sel.mean()) if len(yv) else 0.0, "active": active, "epochs": len(curve),
         }
         prev = self.history[-1] if self.history else None
         was_active = self.active
@@ -487,13 +625,13 @@ class Brain:
             self.last_train_n = len(y)
             self.importance = imp
         best_ep = min(curve, key=lambda c: c["val"])["epoch"]
-        lines = [f"Ошибка: на обучении {curve[-1]['train']:.3f}, на проверке {run['val_loss']:.3f} (лучшая на проходе {best_ep})"]
-        if best_ep < len(curve) * 0.5 and curve[-1]["val"] > run["val_loss"] * 1.05:
-            lines.append("После середины обучения ошибка на проверке росла — начала заучивать прошлое; "
-                         f"оставила версию с прохода {best_ep}")
+        lines = [f"Ошибка: на обучении {curve[-1]['train']:.3f}, на проверке {run['val_loss']:.3f} "
+                 f"(лучшая на проходе {best_ep} из {len(curve)})"]
+        if len(curve) < self.a.nn_epochs:
+            lines.append(f"Остановилась на проходе {len(curve)}: дальше проверка не улучшалась — это было бы заучивание шума")
         lines.append(f"Связь прогноза с реальным итогом на проверке: {corr:+.2f} "
                      + ("(слабая)" if abs(corr) < 0.15 else "(заметная)" if abs(corr) < 0.4 else "(сильная)"))
-        lines.append(f"На проверке выбрала бы {run['sel_n']} из {run['val_n']} сеток: в среднем {sel_avg:+.3f}% "
+        lines.append(f"На проверке выбрала бы {run['sel_n']:,} из {run['val_n']:,} сеток: в среднем {sel_avg:+.3f}% "
                      f"против {base_avg:+.3f}% у всех сеток сканера")
         if prev:
             d = sel_avg - prev["sel_avg"]
@@ -576,11 +714,11 @@ class Brain:
             try:
                 if time.time() - self.last_boot > self.a.nn_refresh * 60:
                     self.status_text = "собираю учебные сетки" if not self.model else self.status_text
+                    self.last_boot = time.time()      # даже если сбор упадёт, не долбим биржу каждые 20 сек
                     added = self.bootstrap()
-                    self.last_boot = time.time()
-                    log.info("Нейросеть: +%d учебных примеров (всего %d)", added, len(self.y))
+                    log.info("Нейросеть: +%d учебных примеров (всего %d)", added, self.n())
                     self.save()
-                if len(self.y) - self.last_train_n >= self.a.nn_retrain_every or (self.model is None and len(self.y) >= 300):
+                if self.n() - self.last_train_n >= self.a.nn_retrain_every or (self.model is None and self.n() >= 300):
                     self.train()
                 self.progress = ""
             except Exception as e:  # noqa: BLE001
@@ -591,7 +729,7 @@ class Brain:
     def start(self):
         if self.model:
             self.think("plan", "Запускаюсь с сохранённой памятью",
-                       [f"В памяти {len(self.y)} примеров, обучений было {len(self.history)}",
+                       [f"В памяти {self.n():,} примеров, обучений было {len(self.history)}",
                         "Сейчас: " + ("принимаю решения" if self.active else "учусь, решает сканер")] + self.plan_lines())
         else:
             self.think("plan", "Запускаюсь с нуля",
@@ -601,13 +739,13 @@ class Brain:
 
     def status(self):
         with self.lock:
-            kinds = self.kind
             return {
                 "active": self.active, "text": self.status_text, "progress": self.progress,
-                "samples": len(self.y), "real": sum(1 for k in kinds if k == 1),
+                "samples": self.n(), "real": int((self.kind == 1).sum()) + sum(1 for b in self._buf if b[4] == 1),
                 "history": self.history[-200:], "curve": self.curve, "preds": self.preds[:12],
                 "min_edge": self.a.nn_min_edge, "enabled": self.a.nn,
                 "horizon": int(min(HORIZON_MIN, self.a.max_minutes)),
                 "thoughts": list(self.thoughts)[:80], "plan": self.plan_lines(),
                 "importance": [{"name": FEATURE_RU[k], "value": v} for k, v in self.importance[:8]],
+                "hist": self.hist,
             }
