@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="uk" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NY Breakout Autopilot</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+tailwind.config = { darkMode: 'class', theme: { extend: {
+  colors: { brand: { 500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 900: '#1e3a8a' },
+            dark: { bg: '#080B11', card: '#111622', border: '#1E2638', hover: '#192030' },
+            bullish: '#00E676', bearish: '#FF5252' },
+  fontFamily: { sans: ['Inter', 'sans-serif'], mono: ['JetBrains Mono', 'monospace'] } } } };
+</script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  body { font-family: 'Inter', sans-serif; background:#080B11; color:#94a3b8; }
+  .font-mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+  ::-webkit-scrollbar { width:6px; height:6px } ::-webkit-scrollbar-track { background:#080B11 }
+  ::-webkit-scrollbar-thumb { background:#1E2638; border-radius:3px }
+  .ok { color:#00E676 } .no { color:#475569 } .warn { color:#f59e0b }
+  .toast { transition: opacity .25s }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid #3b82f6; outline-offset:1px }
+</style>
+</head>
+<body class="min-h-screen flex flex-col bg-dark-bg text-gray-300">
+
+<header class="border-b border-dark-border bg-dark-card px-4 py-3 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-50">
+  <div class="flex items-center gap-3">
+    <div class="bg-gradient-to-tr from-brand-600 to-indigo-500 p-2.5 rounded-xl text-white shadow-lg shadow-brand-500/20">
+      <i class="fa-solid fa-chart-column text-xl"></i>
+    </div>
+    <div>
+      <h1 class="font-bold text-white tracking-wide text-lg leading-tight flex items-center gap-2">
+        NY Breakout Autopilot
+        <span id="mode-badge" class="text-[10px] font-semibold px-2 py-0.5 rounded border uppercase tracking-wider">…</span>
+      </h1>
+      <p class="text-xs text-gray-400">Стратегія Влада Дудукчанова • Bybit USDT-perp • PDH/PDL пробій + ретест</p>
+    </div>
+  </div>
+
+  <div class="flex items-center bg-dark-bg border border-dark-border p-1 rounded-xl gap-1">
+    <button onclick="switchTab('live')" id="tab-btn-live" class="px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition bg-brand-600 text-white">
+      <span class="h-2 w-2 rounded-full bg-emerald-400 animate-pulse"></span> LIVE АВТОПІЛОТ
+    </button>
+    <button onclick="switchTab('backtest')" id="tab-btn-bt" class="px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition text-gray-400 hover:text-white">
+      <i class="fa-solid fa-clock-rotate-left text-amber-400"></i> БЕКТЕСТ
+    </button>
+  </div>
+
+  <div class="flex items-center gap-3 flex-wrap">
+    <div id="sym-buttons" class="flex items-center bg-dark-bg border border-dark-border rounded-lg p-1 text-xs"></div>
+    <div class="flex items-center gap-2 bg-dark-bg border border-dark-border px-3 py-1.5 rounded-lg text-xs">
+      <span id="conn-dot" class="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
+      <span id="conn-text" class="font-mono text-gray-300">З'єднання…</span>
+      <span id="live-price" class="font-mono font-bold text-white ml-2 text-sm">--.--</span>
+    </div>
+    <div class="bg-dark-bg border border-dark-border px-3 py-1.5 rounded-lg text-xs flex flex-col">
+      <span class="text-[9px] uppercase tracking-wider text-gray-500 font-semibold">Київ / Нью-Йорк</span>
+      <span id="clock" class="font-mono text-xs text-white font-bold">--:--:-- / --:--:--</span>
+    </div>
+  </div>
+</header>
+
+<div id="error-box" class="hidden mx-4 mt-4 p-3 rounded-lg bg-red-950/60 border border-red-800 text-red-200 text-sm font-mono whitespace-pre-wrap"></div>
+
+<!-- ================= LIVE ================= -->
+<div id="view-live" class="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 p-4 max-w-[1920px] mx-auto w-full">
+
+  <div class="lg:col-span-3 flex flex-col gap-4 min-w-0">
+    <!-- Автопілот -->
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center justify-between border-b border-dark-border pb-2">
+        <span class="flex items-center gap-2"><i class="fa-solid fa-robot text-brand-500"></i> Автопілот</span>
+        <span id="auto-state" class="text-[11px] font-bold px-2 py-0.5 rounded">…</span>
+      </h2>
+      <div id="session-line" class="text-xs bg-dark-bg border border-dark-border rounded-lg p-2.5 font-mono"></div>
+      <div id="key-row" class="hidden">
+        <label for="ctrl-key" class="text-gray-400 text-xs block mb-1">Ключ керування (CONTROL_KEY)</label>
+        <input id="ctrl-key" type="password" autocomplete="current-password" class="w-full bg-dark-bg border border-dark-border rounded-lg px-2.5 py-1.5 text-white font-mono text-xs">
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <button id="btn-start" onclick="control('start')" class="py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs disabled:opacity-30">
+          <i class="fa-solid fa-play"></i> СТАРТ
+        </button>
+        <button id="btn-pause" onclick="control('pause')" class="py-2.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg text-xs disabled:opacity-30">
+          <i class="fa-solid fa-pause"></i> ПАУЗА
+        </button>
+      </div>
+      <button onclick="askCloseAll()" id="btn-close-all" class="py-2 bg-dark-bg border border-red-800 text-red-300 hover:bg-red-950 font-bold rounded-lg text-xs">
+        <i class="fa-solid fa-xmark"></i> ЗАКРИТИ ВСЕ І ПАУЗА
+      </button>
+      <div id="confirm-close-all" class="hidden text-xs bg-red-950/50 border border-red-800 rounded-lg p-2.5">
+        <p class="text-red-200 mb-2">Закрити всі позиції лімітками з догоном і поставити автопілот на паузу?</p>
+        <div class="flex gap-2">
+          <button onclick="control('close_all'); hideCloseAll()" class="px-3 py-1 bg-red-600 text-white rounded font-bold">Так, закрити</button>
+          <button onclick="hideCloseAll()" class="px-3 py-1 bg-dark-hover text-white rounded">Скасувати</button>
+        </div>
+      </div>
+      <p class="text-[11px] text-gray-500 leading-relaxed">Пауза зупиняє нові входи. Відкриті угоди лишаються з тейком і стопом на біржі.</p>
+    </div>
+
+    <!-- Ризик -->
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2 border-b border-dark-border pb-2">
+        <i class="fa-solid fa-calculator text-brand-500"></i> Ризик і позиція
+      </h2>
+      <div class="bg-dark-bg p-3 rounded-lg border border-dark-border text-xs space-y-1.5 font-mono">
+        <div class="flex justify-between"><span class="text-gray-400">Баланс USDT:</span><span id="r-balance" class="text-white font-bold">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Ризик на угоду:</span><span id="r-risk" class="text-bearish font-bold">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Stop-Loss:</span><span id="r-sl" class="text-white">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Б/У / Тейк:</span><span id="r-rr" class="text-emerald-400 font-bold">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Об'єм зараз (≈):</span><span id="r-qty" class="text-brand-500 font-bold">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Комісії на угоду:</span><span id="r-fee" class="text-amber-400">—</span></div>
+      </div>
+    </div>
+
+    <!-- Чекліст -->
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center justify-between border-b border-dark-border pb-2">
+        <span class="flex items-center gap-2"><i class="fa-solid fa-list-check text-brand-500"></i> Чекліст (авто)</span>
+        <span id="check-candle" class="text-[10px] text-gray-500 font-mono font-normal"></span>
+      </h2>
+      <div id="checklist" class="space-y-2 text-xs"></div>
+    </div>
+  </div>
+
+  <div class="lg:col-span-6 flex flex-col gap-4 min-w-0">
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col flex-1 min-h-[540px]">
+      <div class="flex items-center justify-between border-b border-dark-border pb-3 mb-3 flex-wrap gap-2">
+        <div class="flex items-center gap-3">
+          <span id="chart-title" class="font-bold text-white text-base">—</span>
+          <div class="flex gap-1 text-xs font-mono">
+            <button onclick="changeTf('1')" id="tf-1" class="px-2 py-0.5 rounded">1m</button>
+            <button onclick="changeTf('5')" id="tf-5" class="px-2 py-0.5 rounded">5m</button>
+            <button onclick="changeTf('15')" id="tf-15" class="px-2 py-0.5 rounded">15m</button>
+          </div>
+        </div>
+        <div class="flex items-center gap-4 text-xs font-mono">
+          <span><span class="text-gray-400">PDH:</span> <strong id="pdh" class="text-brand-500">--</strong></span>
+          <span><span class="text-gray-400">PDL:</span> <strong id="pdl" class="text-bearish">--</strong></span>
+        </div>
+      </div>
+      <div id="chart" class="w-full flex-1 rounded-lg overflow-hidden border border-dark-border bg-dark-bg min-h-[420px]"></div>
+
+      <div id="pos-bar" class="hidden mt-3 p-3 bg-dark-bg border border-dark-border rounded-lg flex items-center justify-between flex-wrap gap-2 text-xs">
+        <div class="flex items-center gap-3 flex-wrap">
+          <span id="pos-badge" class="px-2 py-0.5 rounded font-bold uppercase text-white">—</span>
+          <span class="text-gray-400">Вхід: <strong id="pos-entry" class="text-white font-mono"></strong></span>
+          <span class="text-gray-400">Стоп: <strong id="pos-sl" class="text-bearish font-mono"></strong></span>
+          <span class="text-gray-400">Б/У (2R): <strong id="pos-be" class="text-amber-400 font-mono"></strong></span>
+          <span class="text-gray-400">TP (3R): <strong id="pos-tp" class="text-emerald-400 font-mono"></strong></span>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="text-gray-500">PnL: <span id="pos-pnl" class="font-mono font-bold ml-1"></span></span>
+          <button onclick="control('close', currentSymbol)" class="px-2.5 py-1 bg-dark-hover hover:bg-gray-700 text-white rounded font-medium">Закрити</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-gradient-to-r from-brand-900/30 to-dark-card border border-brand-500/20 rounded-xl p-4 flex items-center gap-3">
+      <div class="p-2.5 rounded-xl bg-brand-500/10 text-brand-500 border border-brand-500/20 text-xl"><i class="fa-solid fa-satellite-dish"></i></div>
+      <div class="text-xs min-w-0">
+        <h4 class="font-bold text-white text-sm" id="scan-title">Сканер PDH/PDL</h4>
+        <p class="text-gray-400 mt-0.5" id="scan-desc">Очікування даних від бота…</p>
+      </div>
+    </div>
+
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4">
+      <h3 class="text-xs font-bold text-white uppercase tracking-wider mb-2 flex items-center gap-2"><i class="fa-solid fa-terminal text-brand-500"></i> Події бота</h3>
+      <div id="events" class="font-mono text-[11px] space-y-1 max-h-[220px] overflow-y-auto"></div>
+    </div>
+  </div>
+
+  <div class="lg:col-span-3 flex flex-col gap-4 min-w-0">
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2 border-b border-dark-border pb-2">
+        <i class="fa-solid fa-chart-pie text-brand-500"></i> Реальні результати
+      </h2>
+      <div class="grid grid-cols-2 gap-2 text-xs">
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[11px]">Загальний PnL</span><span id="s-pnl" class="text-base font-bold font-mono text-white">$0.00</span></div>
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[11px]">Вінрейт</span><span id="s-wr" class="text-base font-bold font-mono text-white">0%</span></div>
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[11px]">Профіт фактор</span><span id="s-pf" class="text-base font-bold font-mono text-white">0.00</span></div>
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[11px]">Угод</span><span id="s-count" class="text-base font-bold font-mono text-white">0</span></div>
+      </div>
+    </div>
+
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col flex-1">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2 border-b border-dark-border pb-2 mb-3">
+        <i class="fa-solid fa-book text-brand-500"></i> Журнал угод (Bybit)
+      </h2>
+      <div class="overflow-y-auto max-h-[360px] flex-1 pr-1">
+        <table class="w-full text-left border-collapse text-xs">
+          <thead><tr class="text-gray-500 border-b border-dark-border text-[11px]">
+            <th class="pb-1 font-medium">Дата</th><th class="pb-1 font-medium">Угода</th><th class="pb-1 font-medium">Результат</th><th class="pb-1 font-medium text-right">PnL</th>
+          </tr></thead>
+          <tbody id="journal"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="bg-dark-card border border-dark-border rounded-xl p-3.5 text-xs">
+      <span class="text-xs font-bold text-amber-400 mb-1 flex items-center gap-1.5"><i class="fa-solid fa-shield-halved"></i> Правила автопілота</span>
+      <p class="text-gray-400 leading-relaxed text-[11px]" id="rules"></p>
+    </div>
+  </div>
+</div>
+
+<!-- ================= БЕКТЕСТ ================= -->
+<div id="view-backtest" class="hidden flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 p-4 max-w-[1920px] mx-auto w-full">
+  <div class="lg:col-span-3 flex flex-col gap-4 min-w-0">
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-4">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2 border-b border-dark-border pb-2">
+        <i class="fa-solid fa-sliders text-amber-400"></i> Бектест на реальних свічках
+      </h2>
+      <div class="space-y-3 text-xs">
+        <div><label for="bt-asset" class="text-gray-400 block mb-1">Актив</label>
+          <select id="bt-asset" class="w-full bg-dark-bg border border-dark-border rounded-lg px-2.5 py-2 text-white font-semibold"></select></div>
+        <div class="grid grid-cols-3 gap-2">
+          <div><label for="bt-days" class="text-gray-400 block mb-1">Днів</label>
+            <input id="bt-days" type="number" value="30" min="5" max="60" class="w-full bg-dark-bg border border-dark-border rounded-lg px-2 py-1.5 text-white font-mono"></div>
+          <div><label for="bt-balance" class="text-gray-400 block mb-1">Капітал $</label>
+            <input id="bt-balance" type="number" value="10000" class="w-full bg-dark-bg border border-dark-border rounded-lg px-2 py-1.5 text-white font-mono"></div>
+          <div><label for="bt-risk" class="text-gray-400 block mb-1">Ризик %</label>
+            <input id="bt-risk" type="number" value="1" step="0.5" class="w-full bg-dark-bg border border-dark-border rounded-lg px-2 py-1.5 text-white font-mono"></div>
+        </div>
+        <div id="bt-params" class="bg-dark-bg/60 p-3 rounded-lg border border-dark-border space-y-1 text-[11px]"></div>
+        <button onclick="runBacktest()" id="btn-run-bt" class="w-full py-3 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-extrabold rounded-xl text-xs flex items-center justify-center gap-2">
+          <i class="fa-solid fa-play text-sm"></i> ЗАПУСТИТИ БЕКТЕСТ
+        </button>
+        <p class="text-[11px] text-gray-500 leading-relaxed">Дані — 1-хвилинні свічки Bybit. Ті самі правила, що й у бота, з комісіями. Якщо в одній свічці зачеплено і стоп, і тейк — рахується стоп.</p>
+      </div>
+    </div>
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
+      <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center justify-between border-b border-dark-border pb-2">
+        <span><i class="fa-solid fa-film text-brand-500"></i> Плеєр угод</span><span id="bt-step" class="text-amber-400 font-mono text-[11px]">0 / 0</span>
+      </h3>
+      <div class="flex items-center justify-between gap-2">
+        <button onclick="replayStep(-1)" class="p-2 bg-dark-bg hover:bg-dark-hover border border-dark-border rounded-lg text-xs" aria-label="Попередня угода"><i class="fa-solid fa-backward-step"></i></button>
+        <button onclick="toggleReplay()" id="btn-play" class="flex-1 py-2 bg-brand-600 hover:bg-brand-500 text-white font-bold rounded-lg text-xs"><i class="fa-solid fa-play"></i> ВІДТВОРИТИ</button>
+        <button onclick="replayStep(1)" class="p-2 bg-dark-bg hover:bg-dark-hover border border-dark-border rounded-lg text-xs" aria-label="Наступна угода"><i class="fa-solid fa-forward-step"></i></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="lg:col-span-6 flex flex-col gap-4 min-w-0">
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col min-h-[300px]">
+      <div class="flex items-center justify-between border-b border-dark-border pb-2 mb-2">
+        <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2"><i class="fa-solid fa-chart-line text-emerald-400"></i> Крива капіталу</h3>
+        <span id="bt-net-head" class="font-mono text-sm font-bold">—</span>
+      </div>
+      <div class="flex-1 w-full relative min-h-[220px]"><canvas id="equity"></canvas></div>
+    </div>
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col flex-1 min-h-[340px]">
+      <div class="flex items-center justify-between border-b border-dark-border pb-2 mb-2 gap-2 flex-wrap">
+        <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2"><i class="fa-solid fa-eye text-brand-500"></i> Свічки угоди</h3>
+        <span id="bt-trade-info" class="font-mono text-xs text-amber-400">Запустіть бектест</span>
+      </div>
+      <div id="bt-chart" class="w-full flex-1 rounded-lg overflow-hidden border border-dark-border bg-dark-bg min-h-[280px]"></div>
+    </div>
+  </div>
+
+  <div class="lg:col-span-3 flex flex-col gap-4 min-w-0">
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col gap-3">
+      <h2 class="text-sm font-bold text-white uppercase tracking-wider border-b border-dark-border pb-2 flex items-center gap-2"><i class="fa-solid fa-square-poll-vertical text-amber-400"></i> Результати</h2>
+      <div class="grid grid-cols-2 gap-2 text-xs font-mono">
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[10px] uppercase font-sans">Вінрейт</span><span id="bt-wr" class="text-base font-bold text-white">—</span></div>
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[10px] uppercase font-sans">Профіт фактор</span><span id="bt-pf" class="text-base font-bold text-white">—</span></div>
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[10px] uppercase font-sans">Макс просідання</span><span id="bt-dd" class="text-base font-bold text-bearish">—</span></div>
+        <div class="bg-dark-bg p-2.5 rounded-lg border border-dark-border"><span class="text-gray-500 block text-[10px] uppercase font-sans">Угод</span><span id="bt-count" class="text-base font-bold text-white">—</span></div>
+      </div>
+      <div class="bg-dark-bg p-3 rounded-lg border border-dark-border text-xs space-y-1.5 font-mono">
+        <div class="flex justify-between"><span class="text-gray-400">Чистий прибуток:</span><span id="bt-net" class="font-bold">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">TP / Б/У / SL:</span><span id="bt-split" class="text-white">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Середнє на угоду:</span><span id="bt-avg" class="text-white">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Серії +/−:</span><span id="bt-streak" class="text-white">—</span></div>
+      </div>
+    </div>
+    <div class="bg-dark-card border border-dark-border rounded-xl p-4 flex flex-col flex-1">
+      <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2 border-b border-dark-border pb-2 mb-3"><i class="fa-solid fa-list text-amber-400"></i> Угоди бектесту</h3>
+      <div class="overflow-y-auto max-h-[420px] flex-1 pr-1">
+        <table class="w-full text-left border-collapse text-xs">
+          <thead><tr class="text-gray-500 border-b border-dark-border text-[11px]"><th class="pb-1 font-medium">Дата</th><th class="pb-1 font-medium">Тип</th><th class="pb-1 font-medium">Результат</th><th class="pb-1 font-medium text-right">PnL</th></tr></thead>
+          <tbody id="bt-journal"><tr><td colspan="4" class="py-8 text-center text-gray-500 italic">Запустіть бектест.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast fixed left-1/2 -translate-x-1/2 bottom-5 bg-white text-black text-sm font-semibold px-4 py-2 rounded-lg opacity-0 pointer-events-none z-[60]"></div>
+
+<footer class="border-t border-dark-border bg-dark-card px-4 py-2.5 text-center text-xs text-gray-500">
+  NY Breakout Autopilot • дані та угоди — Bybit • тільки лімітні ордери
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let S = null, currentSymbol = null, currentTf = '1';
+let chart, series, lines = {}, btChart, btSeries, btLines = [], equityChart;
+let bt = null, btIndex = 0, replayTimer = null;
+
+const fmt = (v, d) => v == null || isNaN(v) ? '—' : Number(v).toLocaleString('en-US', { maximumFractionDigits: d ?? (Math.abs(v) < 10 ? 4 : 2), minimumFractionDigits: 0 });
+const money = v => (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
+const short = s => s.replace('USDT', '');
+function toast(t) { const e = $('toast'); e.textContent = t; e.style.opacity = 1; clearTimeout(e._t); e._t = setTimeout(() => e.style.opacity = 0, 2200); }
+try { $('ctrl-key').value = localStorage.getItem('ctrlKey') || ''; } catch (e) {}
+
+// ---------- графік live
+function makeChart(el) {
+  const c = LightweightCharts.createChart(el, {
+    width: el.clientWidth, height: el.clientHeight,
+    layout: { background: { type: 'solid', color: '#080B11' }, textColor: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono' },
+    grid: { vertLines: { color: '#1E2638' }, horzLines: { color: '#1E2638' } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#1E2638' }, timeScale: { borderColor: '#1E2638', timeVisible: true, secondsVisible: false },
+  });
+  const s = c.addCandlestickSeries({ upColor: '#00E676', downColor: '#FF5252', borderVisible: false, wickUpColor: '#00E676', wickDownColor: '#FF5252' });
+  new ResizeObserver(() => c.applyOptions({ width: el.clientWidth, height: el.clientHeight })).observe(el);
+  return [c, s];
+}
+const toBar = k => ({ time: Math.floor(k.t / 1000), open: k.o, high: k.h, low: k.l, close: k.c });
+function setLine(key, price, color, title, style) {
+  if (lines[key]) { series.removePriceLine(lines[key]); delete lines[key]; }
+  if (price) lines[key] = series.createPriceLine({ price, color, lineWidth: key.startsWith('pd') ? 2 : 1, lineStyle: style ?? LightweightCharts.LineStyle.Solid, title });
+}
+async function loadCandles(full) {
+  if (!currentSymbol) return;
+  try {
+    const r = await fetch(`/api/candles?symbol=${currentSymbol}&tf=${currentTf}&limit=${full ? 300 : 3}`);
+    const ks = await r.json();
+    if (!Array.isArray(ks)) return;
+    if (full) { series.setData(ks.map(toBar)); chart.timeScale().scrollToRealTime(); }
+    else ks.forEach(k => series.update(toBar(k)));
+  } catch (e) {}
+}
+function changeTf(tf) {
+  currentTf = tf;
+  ['1', '5', '15'].forEach(t => $('tf-' + t).className = 'px-2 py-0.5 rounded ' + (t === tf ? 'bg-brand-600 text-white' : 'bg-dark-bg text-gray-400 hover:text-white'));
+  loadCandles(true);
+}
+function changeSymbol(sym) {
+  currentSymbol = sym;
+  [...$('sym-buttons').children].forEach(b => b.className = 'px-3 py-1.5 rounded-md font-semibold transition ' + (b.dataset.sym === sym ? 'text-white bg-brand-600' : 'text-gray-400 hover:text-white'));
+  $('chart-title').textContent = `${short(sym)}/USDT • Bybit`;
+  Object.keys(lines).forEach(k => setLine(k, null));
+  loadCandles(true);
+  if (S) render();
+}
+
+// ---------- стан бота
+async function poll() {
+  try {
+    const r = await fetch('/api/state');
+    S = await r.json();
+    $('conn-dot').className = 'h-2 w-2 rounded-full bg-emerald-400';
+    $('conn-text').textContent = 'Бот онлайн';
+    if (!currentSymbol) initSymbols();
+    render();
+  } catch (e) {
+    $('conn-dot').className = 'h-2 w-2 rounded-full bg-red-500';
+    $('conn-text').textContent = 'Немає зв’язку з ботом';
+  }
+}
+function initSymbols() {
+  $('sym-buttons').innerHTML = S.symbols.map(s => `<button data-sym="${s}" onclick="changeSymbol('${s}')" class="px-3 py-1.5 rounded-md">${short(s)}/USDT</button>`).join('');
+  $('bt-asset').innerHTML = S.symbols.map(s => `<option value="${s}">${short(s)}/USDT</option>`).join('');
+  $('bt-risk').value = S.params.risk_pct;
+  changeSymbol(S.symbols[0]);
+  changeTf('1');
+}
+function check(ok, title, sub) {
+  return `<div class="flex items-start gap-2 p-1.5 rounded"><i class="fa-solid ${ok ? 'fa-circle-check ok' : 'fa-circle no'} mt-0.5"></i>
+    <div><span class="font-semibold text-white block">${title}</span><span class="text-gray-400 text-[11px]">${sub}</span></div></div>`;
+}
+function render() {
+  const p = S.params, m = S.markets[currentSymbol] || {}, sess = S.session;
+  const live = S.mode.startsWith('РЕАЛ');
+  $('mode-badge').textContent = S.mode + (S.dry ? ' • DRY' : '');
+  $('mode-badge').className = 'text-[10px] font-semibold px-2 py-0.5 rounded border uppercase tracking-wider ' + (live ? 'bg-red-500/20 text-red-300 border-red-500/30' : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30');
+  $('error-box').classList.toggle('hidden', !S.error); $('error-box').textContent = S.error || '';
+  $('live-price').textContent = fmt(m.price);
+  $('clock').textContent = `${sess.kyiv} / ${sess.ny}`;
+  $('key-row').classList.toggle('hidden', !S.control_key_required);
+
+  // автопілот
+  const st = $('auto-state');
+  st.textContent = S.paused ? 'ПАУЗА' : 'ТОРГУЄ';
+  st.className = 'text-[11px] font-bold px-2 py-0.5 rounded ' + (S.paused ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400');
+  $('btn-start').disabled = !S.paused; $('btn-pause').disabled = S.paused;
+  const hms = s => `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor(s % 3600 / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  $('session-line').innerHTML = sess.active
+    ? `<span class="ok font-bold">● Вікно NY відкрите</span> <span class="text-gray-400">до кінця ${hms(sess.seconds_to_end)}</span>`
+    : `<span class="text-gray-300 font-bold">○ Вікно ${sess.window_kyiv} (Київ)</span> <span class="text-gray-400">через ${hms(sess.seconds_to_start)}</span>`;
+
+  // ризик
+  const risk = S.balance * p.risk_pct / 100;
+  $('r-balance').textContent = '$' + fmt(S.balance, 2);
+  $('r-risk').textContent = `−$${risk.toFixed(2)} (${p.risk_pct}%)`;
+  $('r-sl').textContent = `${p.sl_pct}% від входу`;
+  $('r-rr').textContent = `+${p.be_r}R / +${p.tp_r}R`;
+  const qty = m.price ? risk / (m.price * p.sl_pct / 100) : 0;
+  $('r-qty').textContent = m.price ? `${fmt(qty, 3)} ${short(currentSymbol)} ≈ $${fmt(qty * m.price, 0)}` : '—';
+  $('r-fee').textContent = `≈ ${(2 * p.fee_pct / p.sl_pct).toFixed(2)}R`;
+
+  // рівні
+  $('pdh').textContent = fmt(m.pdh); $('pdl').textContent = fmt(m.pdl);
+  setLine('pdh', m.pdh, '#3b82f6', 'PDH', LightweightCharts.LineStyle.Dashed);
+  setLine('pdl', m.pdl, '#FF5252', 'PDL', LightweightCharts.LineStyle.Dashed);
+
+  // чекліст по останній закритій свічці
+  const ch = m.check, items = ch && ch.items;
+  const side = items ? (items.long.break ? 'long' : items.short.break ? 'short' : null) : null;
+  const it = side ? items[side] : null;
+  $('check-candle').textContent = ch ? 'свічка ' + new Date(ch.candle.t).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' }) : '';
+  $('checklist').innerHTML =
+    check(sess.active, `Вікно NY (${sess.window_kyiv} Київ)`, 'Відкриття Нью-Йорка, найбільший об’єм') +
+    check(!!it, side ? `Пробій ${side === 'long' ? 'PDH' : 'PDL'}` : 'Пробій PDH або PDL', 'Закриття за вчорашнім рівнем') +
+    check(it && it.retest, 'Ретест рівня', `Тінь торкнулась рівня (±${p.touch_pct}%)`) +
+    check(it && it.strong, 'Сильна сигнальна свічка', `Тіло ≥ ${Math.round(p.strong_body * 100)}% діапазону, у бік пробою`) +
+    check(m.taken_today < p.trades_per_day, `Ліміт угод: ${m.taken_today}/${p.trades_per_day} сьогодні`, 'Не більше однієї угоди на монету в день');
+
+  // сканер
+  const sig = S.events.find(e => e.kind === 'signal' || e.kind === 'trade');
+  $('scan-title').textContent = sig ? (sig.kind === 'signal' ? 'Сигнал' : 'Угода') + ' • ' + new Date(sig.t).toLocaleTimeString('uk-UA') : 'Сканер PDH/PDL';
+  $('scan-desc').textContent = sig ? sig.text : (sess.active ? 'Вікно відкрите — бот перевіряє кожну закриту 1m свічку BTC, ETH, SOL.' : 'Бот чекає вікно NY. Сигнали шукаються тільки в цей час.');
+
+  // події
+  const color = { signal: 'text-brand-500', trade: 'text-white', win: 'ok', loss: 'text-bearish', warn: 'warn', info: 'text-gray-400' };
+  $('events').innerHTML = S.events.map(e => `<div class="${color[e.kind] || ''}"><span class="text-gray-600">${new Date(e.t).toLocaleTimeString('uk-UA')}</span> ${escapeHtml(e.text)}</div>`).join('') || '<div class="text-gray-500">Подій ще немає</div>';
+
+  // активна позиція
+  const tr = S.trades.find(t => t.symbol === currentSymbol);
+  $('pos-bar').classList.toggle('hidden', !tr);
+  if (tr) {
+    const isL = tr.side === 'Buy';
+    $('pos-badge').textContent = isL ? 'LONG' : 'SHORT';
+    $('pos-badge').className = 'px-2 py-0.5 rounded font-bold uppercase text-white ' + (isL ? 'bg-emerald-600' : 'bg-bearish');
+    $('pos-entry').textContent = fmt(tr.entry); $('pos-sl').textContent = fmt(tr.stop) + (tr.be ? ' (Б/У)' : '');
+    $('pos-be').textContent = fmt(tr.be_trigger); $('pos-tp').textContent = fmt(tr.tp);
+    $('pos-pnl').textContent = `${money(tr.pnl_now)} (${tr.r_now.toFixed(2)}R)`;
+    $('pos-pnl').className = 'font-mono font-bold ml-1 ' + (tr.pnl_now >= 0 ? 'text-emerald-400' : 'text-bearish');
+    setLine('entry', tr.entry, '#3b82f6', 'ВХІД'); setLine('sl', tr.stop, tr.be ? '#f59e0b' : '#FF5252', tr.be ? 'СТОП Б/У' : 'SL');
+    setLine('tp', tr.tp, '#00E676', 'TP 3R'); setLine('be', tr.be ? null : tr.be_trigger, '#f59e0b', '→ Б/У', LightweightCharts.LineStyle.Dotted);
+  } else ['entry', 'sl', 'tp', 'be'].forEach(k => setLine(k, null));
+
+  // маркери угод
+  const mk = S.journal.concat(S.trades).filter(t => t.symbol === currentSymbol && t.t_open).map(t => ({
+    time: Math.floor(t.signal_t / 1000), position: t.side === 'Buy' ? 'belowBar' : 'aboveBar',
+    color: t.side === 'Buy' ? '#00E676' : '#FF5252', shape: t.side === 'Buy' ? 'arrowUp' : 'arrowDown', text: t.outcome || 'IN' }))
+    .sort((a, b) => a.time - b.time);
+  try { series.setMarkers(mk); } catch (e) {}
+
+  // статистика і журнал
+  const s = S.stats;
+  $('s-pnl').textContent = money(s.pnl); $('s-pnl').className = 'text-base font-bold font-mono ' + (s.pnl >= 0 ? 'text-emerald-400' : 'text-bearish');
+  $('s-wr').textContent = s.winrate.toFixed(1) + '%'; $('s-pf').textContent = s.pf.toFixed(2); $('s-count').textContent = s.count;
+  $('journal').innerHTML = S.journal.length ? S.journal.map(t => {
+    const c = t.pnl > 0 ? 'text-emerald-400' : t.pnl < 0 ? 'text-bearish' : 'text-amber-400';
+    return `<tr class="border-b border-dark-border/40"><td class="py-2 font-mono text-gray-400">${new Date(t.t_open).toLocaleDateString('uk-UA', { day: '2-digit', month: '2-digit' })}</td>
+      <td class="py-2"><span class="${t.side === 'Buy' ? 'text-emerald-400' : 'text-bearish'} font-semibold">${short(t.symbol)} ${t.side === 'Buy' ? 'L' : 'S'}</span></td>
+      <td class="py-2 text-gray-300">${t.outcome} <span class="font-mono ${c}">${t.r >= 0 ? '+' : ''}${t.r.toFixed(1)}R</span></td>
+      <td class="py-2 text-right font-mono font-bold ${c}">${money(t.pnl)}</td></tr>`;
+  }).join('') : '<tr><td colspan="4" class="py-8 text-center text-gray-500 italic">Угод ще не було.</td></tr>';
+
+  $('rules').innerHTML = `• Вхід тільки у вікно ${sess.window_kyiv} за Києвом (9:30–10:30 NY), будні.<br>
+    • Пробій + ретест PDH/PDL, сильна свічка, ${p.trades_per_day} угода на монету в день.<br>
+    • Стоп ${p.sl_pct}%, ризик ${p.risk_pct}% балансу. На +${p.be_r}R стоп у Б/У, тейк +${p.tp_r}R.<br>
+    • Тільки лімітки: вхід і вихід з догоном, на біржі стоїть тейк і стоп-ліміт.<br>
+    • Комісії ≈ ${(2 * p.fee_pct / p.sl_pct).toFixed(2)}R на угоду — вже враховані в бектесті.`;
+  $('bt-params').innerHTML = `<div class="flex justify-between text-gray-400"><span>Сигнал:</span><span class="text-white font-semibold">PDH/PDL пробій + ретест</span></div>
+    <div class="flex justify-between text-gray-400"><span>Стоп / Б/У / Тейк:</span><span class="text-emerald-400 font-bold">${p.sl_pct}% / +${p.be_r}R / +${p.tp_r}R</span></div>
+    <div class="flex justify-between text-gray-400"><span>Комісія:</span><span class="text-amber-400 font-bold">${p.fee_pct}% × 2 ≈ ${(2 * p.fee_pct / p.sl_pct).toFixed(2)}R</span></div>`;
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+// ---------- керування
+async function control(action, symbol) {
+  const key = $('ctrl-key').value;
+  try { localStorage.setItem('ctrlKey', key); } catch (e) {}
+  try {
+    const r = await fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, symbol, key }) });
+    const d = await r.json();
+    if (!r.ok) { toast(d.error || 'Помилка'); if (r.status === 403) $('key-row').classList.remove('hidden'); return; }
+    toast({ start: 'Автопілот запущено', pause: 'Пауза: нові входи вимкнені', close: 'Закриваю лімітками…', close_all: 'Закриваю все лімітками…' }[action]);
+    setTimeout(poll, 600);
+  } catch (e) { toast('Немає зв’язку з ботом'); }
+}
+function askCloseAll() { $('confirm-close-all').classList.remove('hidden'); }
+function hideCloseAll() { $('confirm-close-all').classList.add('hidden'); }
+
+// ---------- вкладки
+function switchTab(tab) {
+  const live = tab === 'live';
+  $('view-live').classList.toggle('hidden', !live); $('view-backtest').classList.toggle('hidden', live);
+  $('tab-btn-live').className = 'px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition ' + (live ? 'bg-brand-600 text-white' : 'text-gray-400 hover:text-white');
+  $('tab-btn-bt').className = 'px-4 py-2 rounded-lg font-bold text-xs flex items-center gap-2 transition ' + (!live ? 'bg-amber-500 text-black' : 'text-gray-400 hover:text-white');
+  if (!live && !btChart) { [btChart, btSeries] = makeChart($('bt-chart')); initEquity(); }
+}
+
+// ---------- бектест
+function initEquity() {
+  equityChart = new Chart($('equity').getContext('2d'), {
+    type: 'line', data: { labels: [], datasets: [{ data: [], borderColor: '#00E676', backgroundColor: 'rgba(0,230,118,.08)', fill: true, tension: .2, pointRadius: 3 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { x: { grid: { color: '#1E2638' }, ticks: { color: '#64748b', font: { size: 10 } } }, y: { grid: { color: '#1E2638' }, ticks: { color: '#64748b', font: { size: 10 } } } } }
+  });
+}
+async function runBacktest() {
+  const btn = $('btn-run-bt');
+  btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner animate-spin"></i> Завантажую свічки Bybit…';
+  try {
+    const q = new URLSearchParams({ symbol: $('bt-asset').value, days: $('bt-days').value, balance: $('bt-balance').value, risk: $('bt-risk').value });
+    const r = await fetch('/api/backtest?' + q);
+    bt = await r.json();
+    if (!r.ok) throw new Error(bt.error || 'помилка');
+    renderBacktest();
+  } catch (e) { toast('Бектест: ' + e.message); }
+  btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-play text-sm"></i> ЗАПУСТИТИ БЕКТЕСТ';
+}
+function renderBacktest() {
+  const s = bt.stats;
+  $('bt-wr').textContent = s.winrate.toFixed(1) + '%'; $('bt-pf').textContent = s.pf.toFixed(2);
+  $('bt-dd').textContent = s.max_dd.toFixed(1) + '%'; $('bt-count').textContent = s.count;
+  const net = `${money(s.net)} (${s.net_pct >= 0 ? '+' : ''}${s.net_pct.toFixed(1)}%)`;
+  $('bt-net').textContent = net; $('bt-net').className = 'font-bold ' + (s.net >= 0 ? 'text-emerald-400' : 'text-bearish');
+  $('bt-net-head').textContent = net; $('bt-net-head').className = 'font-mono text-sm font-bold ' + (s.net >= 0 ? 'text-emerald-400' : 'text-bearish');
+  $('bt-split').textContent = `${s.tp} / ${s.be} / ${s.sl}` + (s.open ? ` / ${s.open} відкр.` : '');
+  $('bt-avg').textContent = `${s.avg_r >= 0 ? '+' : ''}${s.avg_r.toFixed(2)}R`;
+  $('bt-streak').textContent = `${s.max_wins} / ${s.max_losses}`;
+  equityChart.data.labels = bt.equity.map(e => e.label);
+  equityChart.data.datasets[0].data = bt.equity.map(e => e.balance);
+  equityChart.data.datasets[0].borderColor = s.net >= 0 ? '#00E676' : '#FF5252';
+  equityChart.update();
+  $('bt-journal').innerHTML = bt.trades.length ? bt.trades.map((t, i) => {
+    const c = t.pnl > 0 ? 'text-emerald-400' : t.pnl < 0 ? 'text-bearish' : 'text-amber-400';
+    return `<tr onclick="showBt(${i})" class="hover:bg-dark-hover cursor-pointer border-b border-dark-border/40"><td class="py-2 font-mono text-gray-400">${t.date.slice(5)}</td>
+      <td class="py-2 font-bold ${t.side === 'Buy' ? 'text-emerald-400' : 'text-bearish'}">${t.side === 'Buy' ? 'LONG' : 'SHORT'}</td>
+      <td class="py-2 text-gray-300">${t.outcome} ${t.r >= 0 ? '+' : ''}${t.r.toFixed(2)}R</td><td class="py-2 text-right font-mono ${c}">${money(t.pnl)}</td></tr>`;
+  }).join('') : '<tr><td colspan="4" class="py-8 text-center text-gray-500 italic">За цей період сигналів не було.</td></tr>';
+  if (bt.trades.length) showBt(0); else { $('bt-step').textContent = '0 / 0'; $('bt-trade-info').textContent = 'Сигналів не було'; btSeries.setData([]); }
+}
+function showBt(i) {
+  if (!bt || !bt.trades[i]) return;
+  btIndex = i; const t = bt.trades[i];
+  $('bt-step').textContent = `${i + 1} / ${bt.trades.length}`;
+  $('bt-trade-info').textContent = `${t.date} • ${t.side === 'Buy' ? 'LONG' : 'SHORT'} @ ${fmt(t.entry)} → ${t.outcome} (${t.r >= 0 ? '+' : ''}${t.r.toFixed(2)}R)`;
+  btLines.forEach(l => btSeries.removePriceLine(l)); btLines = [];
+  btSeries.setData(t.candles.map(toBar));
+  const L = (price, color, title, style) => btLines.push(btSeries.createPriceLine({ price, color, lineWidth: 1, lineStyle: style ?? 0, title }));
+  L(t.side === 'Buy' ? t.pdh : t.pdl, '#3b82f6', t.side === 'Buy' ? 'PDH' : 'PDL', 2);
+  L(t.entry, '#e2e8f0', 'ВХІД'); L(t.sl, '#FF5252', 'SL'); L(t.tp, '#00E676', 'TP'); L(t.be_trigger, '#f59e0b', 'Б/У', 1);
+  const mk = [{ time: Math.floor(t.t / 1000), position: t.side === 'Buy' ? 'belowBar' : 'aboveBar', color: '#3b82f6', shape: t.side === 'Buy' ? 'arrowUp' : 'arrowDown', text: 'ВХІД' }];
+  if (t.exit_t) mk.push({ time: Math.floor(t.exit_t / 1000), position: 'aboveBar', color: t.r > 0 ? '#00E676' : '#FF5252', shape: 'circle', text: t.outcome });
+  btSeries.setMarkers(mk.sort((a, b) => a.time - b.time));
+  btChart.timeScale().fitContent();
+}
+function replayStep(d) { if (bt) showBt(Math.max(0, Math.min(bt.trades.length - 1, btIndex + d))); }
+function toggleReplay() {
+  const b = $('btn-play');
+  if (replayTimer) { clearInterval(replayTimer); replayTimer = null; b.innerHTML = '<i class="fa-solid fa-play"></i> ВІДТВОРИТИ'; return; }
+  if (!bt || !bt.trades.length) return;
+  b.innerHTML = '<i class="fa-solid fa-pause"></i> ПАУЗА';
+  replayTimer = setInterval(() => { if (btIndex < bt.trades.length - 1) showBt(btIndex + 1); else toggleReplay(); }, 1500);
+}
+
+// ---------- старт
+[chart, series] = makeChart($('chart'));
+poll();
+setInterval(poll, 2000);
+setInterval(() => loadCandles(false), 3000);
+</script>
+</body>
+</html>

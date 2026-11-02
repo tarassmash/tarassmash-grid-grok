@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "python bybit_grid_bot.py",
+    "startCommand": "python ny_bot.py",
     "restartPolicyType": "ALWAYS",
     "sleepApplication": false,
     "numReplicas": 1
