@@ -138,6 +138,20 @@ def render_nn(nn):
         f"<tr><td>{escape(x['symbol'])}</td><td>{'—' if x['pred'] is None else '%+.3f%%' % x['pred']}</td>"
         f"<td>{x['levels']}</td><td>{x['mult']:g}×</td><td class=\"{'pos' if x['take'] else 'neg'}\">{'беру' if x['take'] else 'пропуск'}</td></tr>"
         for x in nn["preds"]) or '<tr><td colspan="5" class="muted">Прогнозов ещё нет — дождись скана</td></tr>'
+    kinds = {"data": ("ДАННЫЕ", "k-data"), "train": ("ОБУЧЕНИЕ", "k-train"), "decide": ("РЕШЕНИЕ", "k-decide"),
+             "result": ("ИТОГ СЕТКИ", "k-result"), "plan": ("ПЛАН", "k-plan"), "warn": ("ВНИМАНИЕ", "k-warn")}
+    th = "".join(
+        f'<div class="th"><div class="th-h"><span class="tag {kinds.get(x["kind"], ("", ""))[1]}">'
+        f'{kinds.get(x["kind"], (x["kind"], ""))[0]}</span><b>{escape(x["title"])}</b>'
+        f'<span class="th-t">{time.strftime("%d.%m %H:%M:%S", time.gmtime(x["t"] / 1000))} UTC</span></div>'
+        + ("<ul>" + "".join(f"<li>{escape(l)}</li>" for l in x["lines"]) + "</ul>" if x["lines"] else "")
+        + "</div>" for x in nn.get("thoughts", [])) or '<p class="muted">Мыслей пока нет — нейросеть запускается</p>'
+    plan = "".join(f"<li>{escape(l)}</li>" for l in nn.get("plan", []))
+    imp = nn.get("importance") or []
+    mx = max([i["value"] for i in imp] + [1e-9])
+    imp_html = "".join(
+        f'<div class="imp"><span>{escape(i["name"])}</span><div class="bar"><i style="width:{max(0, i["value"]) / mx * 100:.0f}%"></i></div></div>'
+        for i in imp) or '<p class="muted">Появится после первого обучения</p>'
     return f"""
 <div class="panel"><h2>Нейросеть {pill}</h2>{kv}{prog}
   <p class="muted small">Учится на учебных сетках по свежим свечам и на каждой закрытой реальной сетке (вес ×3).
@@ -148,9 +162,12 @@ def render_nn(nn):
   <div class="panel"><h2>Последнее обучение: ошибка по эпохам</h2>{ch1}</div>
   <div class="panel"><h2>Качество на проверке по обучениям</h2>{ch2}</div>
   <div class="panel"><h2>Сколько данных накоплено</h2>{ch3}</div>
+  <div class="panel"><h2>План нейросети</h2><ul class="plan">{plan}</ul>
+    <h2 style="margin-top:14px">На что она опирается</h2>{imp_html}</div>
   <div class="panel"><h2>Прогнозы по текущим кандидатам</h2>
     <div class="scroll"><table><tr><th>Монета</th><th>Прогноз</th><th>Уровней</th><th>Шаг</th><th>Решение</th></tr>{preds}</table></div></div>
-</div>"""
+</div>
+<div class="panel"><h2>Мысли нейросети (новое сверху)</h2><div class="thoughts">{th}</div></div>"""
 
 
 def _fmt(v, nd=4):
@@ -243,7 +260,17 @@ td:first-child,th:first-child{{text-align:left}}th{{font:600 11px system-ui;colo
 .legend{{display:flex;flex-wrap:wrap;gap:12px;margin-top:6px;font-size:12px;color:var(--muted)}}
 .lg i{{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}}
 .nnpill{{font-size:11px;padding:2px 8px;border-radius:999px;margin-left:6px;letter-spacing:.04em}}
-.nnpill.on{{background:#1d3a2f;color:var(--pos)}}.nnpill.off{{background:#3a2f17;color:var(--warn)}}.small{{font-size:12px;margin:8px 0 0}}
+.nnpill.on{{background:#1d3a2f;color:var(--pos)}}.nnpill.off{{background:#3a2f17;color:var(--warn)}}
+.thoughts{{max-height:560px;overflow-y:auto;display:grid;gap:10px}}
+.th{{border-left:3px solid var(--line);padding:4px 0 4px 10px}}
+.th-h{{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 10px}}.th-h b{{font-weight:600}}
+.th-t{{color:var(--muted);font:11px ui-monospace,monospace;margin-left:auto}}
+.th ul,.plan{{margin:6px 0 0;padding-left:18px;color:#c9d6d0;font-size:13px;line-height:1.5}}
+.tag{{font:700 10px system-ui;letter-spacing:.06em;padding:2px 6px;border-radius:4px;background:#1f2a26;color:var(--muted)}}
+.k-data{{background:#17283a;color:#7cb7f0}}.k-train{{background:#2a2140;color:#b9a2f5}}.k-decide{{background:#1d3a2f;color:var(--pos)}}
+.k-result{{background:#3a3417;color:#f0d36a}}.k-plan{{background:#1f2a26;color:#a8c2b8}}.k-warn{{background:#3a2017;color:var(--warn)}}
+.imp{{display:grid;grid-template-columns:minmax(0,190px) 1fr;gap:10px;align-items:center;font-size:12px;margin:5px 0;color:#c9d6d0}}
+.bar{{height:6px;background:var(--line);border-radius:3px;overflow:hidden}}.bar i{{display:block;height:100%;background:var(--acc)}}.small{{font-size:12px;margin:8px 0 0}}
 pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d6d0;white-space:pre-wrap}}
 </style></head><body><div class="wrap">
 <div class="top"><h1>Vol Grid Bot</h1><span class="pill">{escape(str(s['mode']))}</span></div>

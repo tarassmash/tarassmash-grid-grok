@@ -187,30 +187,38 @@ def scan(s, inst, a):
 
 
 def apply_brain(res, a):
-    """Нейросеть оценивает каждого кандидата и вариант шага сетки.
+    """Нейросеть оценивает каждого кандидата и 3 варианта шага сетки.
     Активна (прошла проверку) — выбирает шаг, сортирует по прогнозу и отсекает ожидаемый минус.
-    Не активна — бот работает по сканеру, а сеть запоминает признаки для обучения."""
+    Не активна — бот работает по сканеру, а сеть запоминает признаки для обучения и пишет свои оценки."""
     if not BRAIN:
         return res
-    out, preds = [], []
+    out, decided = [], []
     use = a.nn and BRAIN.active
     for c in res:
-        levels, pred, feats = BRAIN.choose(c)
-        if not use:
-            feats, levels_base = nn.variant(c["nn_base"], 1.0, a.max_levels)
-            c["nn"] = {"pred": pred, "feats": feats, "levels": levels_base}
-        else:
-            c["nn"] = {"pred": pred, "feats": feats, "levels": levels}
-            c["grids"] = levels
-        preds.append({"symbol": c["symbol"], "pred": pred, "levels": levels,
-                      "mult": feats["mult"] if feats else 1.0, "take": (not use) or (pred is not None and pred > a.nn_min_edge)})
-        if use and (pred is None or pred <= a.nn_min_edge):
+        vs = BRAIN.evaluate(c)
+        if not vs:
             continue
-        out.append(c)
+        scored = [v for v in vs if v[2] is not None]
+        best = max(scored, key=lambda v: v[2]) if scored else vs[1]
+        normal = vs[1]
+        pick = best if use else normal
+        mult, levels, pred, feats = pick
+        take = (not use) or (pred is not None and pred > a.nn_min_edge)
+        c["nn"] = {"pred": pred, "feats": feats, "levels": levels}
+        if use:
+            c["grids"] = levels
+        decided.append({"symbol": c["symbol"], "pred": best[2], "levels": best[1], "mult": best[0], "feats": best[3],
+                        "take": take, "variants": vs})
+        if take:
+            out.append(c)
     if use:
         out.sort(key=lambda c: c["nn"]["pred"], reverse=True)
-        preds.sort(key=lambda x: x["pred"] if x["pred"] is not None else -99, reverse=True)
-    BRAIN.preds = preds
+    decided.sort(key=lambda x: x["pred"] if x["pred"] is not None else -99, reverse=True)
+    BRAIN.preds = [{k: d[k] for k in ("symbol", "pred", "levels", "mult", "take")} for d in decided]
+    try:
+        BRAIN.log_decisions(decided, use)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Нейросеть: объяснение не получилось: %s", e)
     return out
 
 
@@ -571,7 +579,7 @@ class Grid:
         log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
         if BRAIN and self.nn and self.notional > 0:
             pnl = self.pnl() - self.a.fee / 100 * abs(self.net) * self.price
-            BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100)
+            BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100, self.nn.get("pred"), self.sym)
             log.info("%s: результат записан в обучение нейросети (%+.3f%% от объёма)", self.sym, pnl / self.notional * 100)
         with web.LOCK:
             web.STATUS["history"].append({"time": time.strftime("%d.%m %H:%M UTC", time.gmtime()), "symbol": self.sym,

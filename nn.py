@@ -12,6 +12,7 @@
 Решения она принимает, только если сетки, которые она отбирает, там в плюсе и лучше обычного отбора.
 """
 
+import collections
 import json
 import logging
 import math
@@ -26,6 +27,15 @@ MULTS = (0.6, 1.0, 1.6)        # множитель шага: частая / о�
 HORIZON_MIN = 60
 FEATURES = ["vol1m", "atr", "er", "step", "levels", "width", "log_turnover", "ret_win", "ret_5",
             "pos_range", "atr_trend", "mult"]
+# как признаки называть в «мыслях» нейросети
+FEATURE_RU = {
+    "vol1m": "размах за минуту", "atr": "средняя волатильность", "er": "трендовость (ER)", "step": "шаг сетки",
+    "levels": "число уровней", "width": "ширина диапазона", "log_turnover": "объём торгов",
+    "ret_win": "движение за 15 мин", "ret_5": "движение за 5 мин", "pos_range": "место цены в диапазоне",
+    "atr_trend": "ускорение волатильности", "mult": "вариант шага",
+}
+MULT_RU = {0.6: "частая", 1.0: "обычная", 1.6: "редкая"}
+MULT_ACC = {0.6: "частую", 1.0: "обычную", 1.6: "редкую"}
 
 
 # ---------------------------------------------------------------- признаки
@@ -243,6 +253,9 @@ class Brain:
         self.last_boot = 0
         self.last_train_n = 0
         self.preds = []                 # прогнозы по последним кандидатам
+        self.thoughts = collections.deque(maxlen=400)   # журнал мыслей: что делает, почему, что дальше
+        self.importance = []            # какие признаки важнее (после обучения)
+        self._last_decision = ("", 0.0)
         os.makedirs(path, exist_ok=True)
         self.load()
 
@@ -257,7 +270,7 @@ class Brain:
                         "model": self.model.to_json() if self.model else None,
                         "mu": self.mu.tolist() if self.mu is not None else None,
                         "sd": self.sd.tolist() if self.sd is not None else None, "features": FEATURES,
-                        "seen": self.seen}
+                        "seen": self.seen, "thoughts": list(self.thoughts)[:200], "importance": self.importance}
             tmp = os.path.join(self.path, "brain.json.tmp")
             with open(tmp, "w") as f:
                 json.dump(data, f)
@@ -278,12 +291,47 @@ class Brain:
                 self.model = MLP.from_json(d["model"])
                 self.mu, self.sd = np.array(d["mu"]), np.array(d["sd"])
             self.seen = d.get("seen") or {}
+            self.thoughts.extend(d.get("thoughts") or [])
+            self.importance = d.get("importance") or []
             self.status_text = f"загружено {len(self.y)} примеров"
             log.info("Нейросеть: загружено %d примеров, модель %s", len(self.y), "активна" if self.active else "учится")
         except FileNotFoundError:
             pass
         except Exception as e:  # noqa: BLE001
             log.warning("Нейросеть: файл не прочитан: %s", e)
+
+    # --- мысли
+    def think(self, kind, title, lines=None):
+        """Запись в журнал мыслей. kind: data | train | decide | result | plan | warn."""
+        self.thoughts.appendleft({"t": int(time.time() * 1000), "kind": kind, "title": title, "lines": lines or []})
+        log.info("Нейросеть [%s]: %s", kind, title)
+
+    def explain(self, f):
+        """Три признака, которые сильнее всего сдвинули прогноз: подставляем вместо признака
+        его среднее значение и смотрим, насколько меняется прогноз."""
+        if not self.model:
+            return []
+        x = (np.array([vec(f)]) - self.mu) / self.sd
+        base = float(self.model.predict(x)[0])
+        X = np.repeat(x, len(FEATURES), axis=0)
+        for k in range(len(FEATURES)):
+            X[k, k] = 0.0       # 0 после нормировки = среднее значение
+        deltas = base - self.model.predict(X)
+        order = np.argsort(-np.abs(deltas))[:3]
+        return [(FEATURES[k], float(deltas[k]), float(f[FEATURES[k]])) for k in order]
+
+    def plan_lines(self):
+        nxt_boot = self.last_boot + self.a.nn_refresh * 60
+        need = max(0, self.a.nn_retrain_every - (len(self.y) - self.last_train_n))
+        out = [f"Следующий сбор учебных сеток: ~{time.strftime('%H:%M UTC', time.gmtime(nxt_boot))}"
+               if self.last_boot else "Сбор учебных сеток: сейчас",
+               f"Переобучение: после ещё {need} новых примеров (обычно сразу после сбора)"]
+        if not self.active:
+            out.append("Чтобы включиться, мои сетки на проверке должны быть в плюсе и лучше всех сеток сканера, "
+                       "и таких сеток должно быть не меньше 30")
+        else:
+            out.append("Сейчас я выбираю монету и шаг сетки; если на проверке стану хуже сканера — сама отключусь")
+        return out
 
     # --- данные
     def add(self, feats, target, kind, t_ms, weight):
@@ -294,10 +342,20 @@ class Brain:
             self.t.append(float(t_ms))
             self.kind.append(kind)
 
-    def add_real(self, feats, target):
+    def add_real(self, feats, target, pred=None, sym=""):
         """Закрытая сетка на бирже: доходность в % от объёма позиции."""
         if feats:
             self.add(feats, target, 1, time.time() * 1000, 3.0)
+            lines = [f"Итог: {target:+.3f}% от объёма позиции"]
+            if pred is not None:
+                err = target - pred
+                lines.append(f"Мой прогноз был {pred:+.3f}% — ошиблась на {err:+.3f}% "
+                             + ("(оказалось лучше, чем думала)" if err > 0 else "(оказалось хуже, чем думала)"))
+            else:
+                lines.append("Прогноза не было — сетку выбрал сканер, пока я училась")
+            n_real = sum(1 for k in self.kind if k == 1)
+            lines.append(f"Запомнила с весом ×3. Реальных сеток в памяти: {n_real}")
+            self.think("result", f"{sym}: разбираю закрытую реальную сетку", lines)
             self.save()
 
     def bootstrap(self):
@@ -306,6 +364,12 @@ class Brain:
         syms = self.symbols()[: a.nn_symbols]
         added = 0
         win = a.window + 1
+        self.think("data", f"Собираю учебные сетки по {len(syms)} монетам",
+                   [f"Беру последние 1000 минутных свечей: {', '.join(s.replace('USDT', '') for s in syms[:12])}"
+                    + (" и др." if len(syms) > 12 else ""),
+                    f"Каждые {a.nn_stride} мин. мысленно ставлю 3 сетки (частую, обычную, редкую) и смотрю, "
+                    f"что было бы через {min(HORIZON_MIN, int(a.max_minutes))} мин. по правилам бота"])
+        n0 = len(self.y)
         for si, sym in enumerate(syms):
             self.progress = f"учебные сетки: {sym} ({si + 1}/{len(syms)})"
             try:
@@ -332,6 +396,29 @@ class Brain:
                     added += 1
         old = time.time() * 1000 - 2 * 86_400_000
         self.seen = {k: v for k, v in self.seen.items() if v >= old}
+        self.last_boot = time.time()
+        if added:
+            with self.lock:
+                Xn = np.array(self.X[n0:], dtype=float)
+                yn = np.array(self.y[n0:], dtype=float)
+            lines = [f"Новых примеров: {added}. Прибыльных: {(yn > 0).mean() * 100:.0f}%, средний итог {yn.mean():+.3f}%"]
+            mcol = Xn[:, FEATURES.index("mult")]
+            best = None
+            for mlt in MULTS:
+                sel = np.isclose(mcol, mlt)
+                if sel.any():
+                    avg = yn[sel].mean()
+                    lines.append(f"{MULT_RU[mlt].capitalize()} сетка: в среднем {avg:+.3f}%, в плюсе {(yn[sel] > 0).mean() * 100:.0f}%")
+                    best = (mlt, avg) if best is None or avg > best[1] else best
+            ercol = Xn[:, FEATURES.index("er")]
+            lo, hi = yn[ercol < 0.3], yn[ercol >= 0.3]
+            if len(lo) and len(hi):
+                lines.append(f"Боковик (ER < 0.3): {lo.mean():+.3f}%, трендовее (ER ≥ 0.3): {hi.mean():+.3f}%")
+            if best:
+                lines.append(f"На свежем рынке лучше всего шла {MULT_RU[best[0]]} сетка")
+            self.think("data", "Учебные сетки собраны", lines)
+        else:
+            self.think("data", "Новых учебных сеток нет", ["Свечи с прошлого сбора уже разобраны — жду новых"])
         with self.lock:
             if len(self.y) > a.nn_max_samples:
                 cut = len(self.y) - a.nn_max_samples
@@ -349,7 +436,12 @@ class Brain:
             kind = np.array(self.kind)
         if len(y) < 300:
             self.status_text = f"мало данных ({len(y)} примеров), жду"
+            self.think("plan", "Мало данных для обучения", [f"Есть {len(y)} примеров, нужно хотя бы 300"] + self.plan_lines())
             return
+        self.think("train", f"Начинаю обучение №{len(self.history) + 1}",
+                   [f"Примеров: {len(y)}, из них реальных сеток: {int((np.array(self.kind) == 1).sum())}",
+                    f"Самые свежие 20% отложу для проверки — их я не увижу при обучении",
+                    f"{self.a.nn_epochs} проходов по данным, оставлю версию с лучшей проверкой"])
         order = np.argsort(t, kind="stable")
         X, y, w, kind = X[order], y[order], w[order], kind[order]
         n_val = max(100, int(len(y) * 0.2))
@@ -369,24 +461,100 @@ class Brain:
         sel_avg = float(yv[sel].mean()) if sel.any() else 0.0
         corr = float(np.corrcoef(pv, yv)[0, 1]) if len(yv) > 2 and np.std(pv) > 0 else 0.0
         active = bool(sel.sum() >= 30 and sel_avg > 0 and sel_avg > base_avg)
+        # важность признаков: насколько растёт ошибка, если перемешать признак на проверке
+        Zv = (Xv - mu) / sd
+        base_err = float(np.mean(np.abs(model.predict(Zv) - yv)))
+        rng = np.random.default_rng(1)
+        imp = []
+        for k in range(len(FEATURES)):
+            Zs = Zv.copy()
+            Zs[:, k] = rng.permutation(Zs[:, k])
+            imp.append((FEATURES[k], float(np.mean(np.abs(model.predict(Zs) - yv)) - base_err)))
+        imp.sort(key=lambda x: -x[1])
         run = {
             "time": int(time.time() * 1000), "samples": int(len(y)), "real": int((kind == 1).sum()),
             "train_loss": curve[-1]["train"], "val_loss": min(c["val"] for c in curve), "corr": corr,
             "sel_avg": sel_avg, "base_avg": base_avg, "sel_n": int(sel.sum()), "val_n": int(len(yv)),
             "sel_share": float(sel.mean()) if len(yv) else 0.0, "active": active,
         }
+        prev = self.history[-1] if self.history else None
+        was_active = self.active
         with self.lock:
             self.model, self.mu, self.sd = model, mu, sd
             self.active = active
             self.curve = curve
             self.history.append(run)
             self.last_train_n = len(y)
+            self.importance = imp
+        best_ep = min(curve, key=lambda c: c["val"])["epoch"]
+        lines = [f"Ошибка: на обучении {curve[-1]['train']:.3f}, на проверке {run['val_loss']:.3f} (лучшая на проходе {best_ep})"]
+        if best_ep < len(curve) * 0.5 and curve[-1]["val"] > run["val_loss"] * 1.05:
+            lines.append("После середины обучения ошибка на проверке росла — начала заучивать прошлое; "
+                         f"оставила версию с прохода {best_ep}")
+        lines.append(f"Связь прогноза с реальным итогом на проверке: {corr:+.2f} "
+                     + ("(слабая)" if abs(corr) < 0.15 else "(заметная)" if abs(corr) < 0.4 else "(сильная)"))
+        lines.append(f"На проверке выбрала бы {run['sel_n']} из {run['val_n']} сеток: в среднем {sel_avg:+.3f}% "
+                     f"против {base_avg:+.3f}% у всех сеток сканера")
+        if prev:
+            d = sel_avg - prev["sel_avg"]
+            lines.append(f"По сравнению с прошлым обучением мой отбор {'лучше' if d > 0 else 'хуже'} на {abs(d):.3f}%")
+        lines.append("Больше всего опираюсь на: " + ", ".join(f"{FEATURE_RU[k]}" for k, v in imp[:4] if v > 0))
+        self.think("train", f"Обучение №{len(self.history)} готово", lines)
+        if active and not was_active:
+            self.think("decide", "Включаюсь в принятие решений",
+                       ["Проверка пройдена: мой отбор в плюсе и лучше сканера", "Теперь выбираю монету и шаг сетки сама"])
+        elif not active and was_active:
+            self.think("warn", "Отключаюсь от решений",
+                       ["На свежей проверке мой отбор больше не лучше сканера — бот торгует по сканеру, я продолжаю учиться"])
+        elif not active:
+            why = ("мало сеток прошли бы мой отбор" if sel.sum() < 30 else
+                   "мой отбор на проверке в минусе" if sel_avg <= 0 else "мой отбор не лучше всех сеток сканера")
+            self.think("warn", "Пока не включаюсь", [f"Причина: {why}"])
+        self.think("plan", "Что дальше", self.plan_lines())
         self.status_text = ("ПРИНИМАЕТ РЕШЕНИЯ" if active else "учится (на проверке пока не лучше сканера)")
         log.info("Нейросеть: обучена на %d примерах | проверка: отбор %+.3f%% vs все %+.3f%% (%d сеток) | %s",
                  len(y), sel_avg, base_avg, run["sel_n"], "активна" if active else "не активна")
         self.save()
 
     # --- решения
+    def evaluate(self, cand):
+        """Все 3 варианта шага: [(множитель, уровней, прогноз, признаки)]."""
+        base = cand.get("nn_base")
+        if not base:
+            return []
+        rows = [variant(base, mlt, self.a.max_levels) for mlt in MULTS]
+        if not self.model:
+            return [(mlt, lv, None, f) for mlt, (f, lv) in zip(MULTS, rows)]
+        with self.lock:
+            X = (np.array([vec(f) for f, _ in rows]) - self.mu) / self.sd
+            p = self.model.predict(X)
+        return [(mlt, lv, float(pp), f) for mlt, (f, lv), pp in zip(MULTS, rows, p)]
+
+    def log_decisions(self, decided, use):
+        """Мысли по скану: прогнозы по вариантам шага и почему беру/пропускаю."""
+        if not decided or not self.model:
+            return
+        top = decided[0]
+        key = f"{top['symbol']}:{top['take']}:{top['mult']}"
+        if key == self._last_decision[0] and time.time() - self._last_decision[1] < 300:
+            return
+        self._last_decision = (key, time.time())
+        lines = []
+        for d in decided[:3]:
+            vs = " | ".join(f"{MULT_RU[m]} {p:+.3f}%" for m, _, p, _ in d["variants"])
+            lines.append(f"{d['symbol']}: {vs}")
+            if use:
+                verdict = (f"→ беру {MULT_ACC[d['mult']]} сетку ({d['levels']} уровней), прогноз {d['pred']:+.3f}%"
+                           if d["take"] else f"→ пропускаю: лучший прогноз {d['pred']:+.3f}% ниже порога {self.a.nn_min_edge:+.2f}%")
+                lines.append(verdict)
+            why = self.explain(d["feats"])
+            if why:
+                lines.append("   почему: " + "; ".join(
+                    f"{FEATURE_RU[k]} = {v:.3g} {'тянет вверх' if dlt > 0 else 'тянет вниз'} {dlt:+.3f}%" for k, dlt, v in why))
+        title = (f"Выбор по скану: {'беру ' + top['symbol'] if top['take'] else 'все кандидаты в минусе — пропускаю'}"
+                 if use else "Оцениваю кандидатов (решает сканер, я пока учусь)")
+        self.think("decide", title, lines)
+
     def choose(self, cand):
         """Лучший вариант шага для кандидата: (уровней, прогноз %, признаки) или прогноз None, если модели нет."""
         base = cand.get("nn_base")
@@ -421,6 +589,14 @@ class Brain:
             time.sleep(20)
 
     def start(self):
+        if self.model:
+            self.think("plan", "Запускаюсь с сохранённой памятью",
+                       [f"В памяти {len(self.y)} примеров, обучений было {len(self.history)}",
+                        "Сейчас: " + ("принимаю решения" if self.active else "учусь, решает сканер")] + self.plan_lines())
+        else:
+            self.think("plan", "Запускаюсь с нуля",
+                       ["Памяти нет — сначала соберу учебные сетки по свежим свечам, потом обучусь",
+                        "Пока я не прошла проверку, монеты выбирает обычный сканер"])
         threading.Thread(target=self.loop, daemon=True).start()
 
     def status(self):
@@ -432,4 +608,6 @@ class Brain:
                 "history": self.history[-200:], "curve": self.curve, "preds": self.preds[:12],
                 "min_edge": self.a.nn_min_edge, "enabled": self.a.nn,
                 "horizon": int(min(HORIZON_MIN, self.a.max_minutes)),
+                "thoughts": list(self.thoughts)[:80], "plan": self.plan_lines(),
+                "importance": [{"name": FEATURE_RU[k], "value": v} for k, v in self.importance[:8]],
             }
