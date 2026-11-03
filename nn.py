@@ -377,6 +377,7 @@ class Brain:
         self.regime_quiet = 0.0         # до какого времени не поднимать новую тревогу
         self.regime_retrained = True
         self.regime_streak = 0
+        self.provisional = False        # включена по правилу «в плюсе», ещё не сравнивалась с обычными настройками
         self.preds = []
         self.thoughts = collections.deque(maxlen=400)
         self.importance = []
@@ -526,7 +527,11 @@ class Brain:
                        f"{n_post} из {a.nn_regime_min_n}")
         elif not self.active:
             out.append(f"Чтобы включиться: за последние {a.nn_eval_min:g} мин мой выбор по факту в плюсе и лучше "
-                       f"обычных настроек, минимум {a.nn_eval_min_n} сделок")
+                       f"обычных настроек, минимум {a.nn_eval_min_n} сделок (после смены рынка, пока итогов обычных "
+                       f"ещё нет, — достаточно быть в плюсе, маржа тогда не больше ×1)")
+        elif self.provisional:
+            out.append("Решаю по правилу «в плюсе» (итогов обычных настроек в новом режиме ещё нет): маржа не больше ×1; "
+                       "как только они появятся — должна быть и лучше их")
         else:
             out.append("Сейчас я выбираю монету, все настройки сетки и маржу; если онлайн-проверка станет хуже "
                        "обычных настроек — сама отключусь")
@@ -950,10 +955,18 @@ class Brain:
         since = self.regime_start if self.regime_start and now - self.regime_start < a.nn_eval_min * 60_000 else None
         om = self.online_metrics(now, a.nn_eval_min, since=since)
         was = self.active
+        self.provisional = False
         if self.regime_hold:
             self.active, src = False, "regime"
-        elif om["sel_n"] >= a.nn_eval_min_n and om["n_dflt"] >= a.nn_eval_min_n:
-            self.active, src = bool(om["sel_avg"] > 0 and om["sel_avg"] > om["base_avg"]), "online"
+        elif om["sel_n"] >= a.nn_eval_min_n:
+            if om["n_dflt"] >= a.nn_eval_min_n:
+                self.active = bool(om["sel_avg"] > 0 and om["sel_avg"] > om["base_avg"])
+            else:
+                # после смены рынка обычные настройки (их сетка 60 мин) ещё не отработали — достаточно быть в плюсе,
+                # но пока не доказала, что лучше обычных, маржа не больше ×1 (см. size_for)
+                self.active = bool(om["sel_avg"] > 0)
+                self.provisional = self.active
+            src = "online"
         else:
             self.active, src = self.val_active, "full"
         if self.model is not None:
@@ -966,15 +979,18 @@ class Brain:
             self.history = self.history[-600:]
         if self.active and not was:
             self.think("decide", "Включаюсь в принятие решений",
-                       [f"За последние {a.nn_eval_min:g} мин мой выбор по факту: {om['sel_avg']:+.3f}% в {om['sel_n']} сделках "
-                        f"против {om['base_avg']:+.3f}% у обычных настроек" if src == "online" else
+                       [(f"За последние {a.nn_eval_min:g} мин мой выбор по факту: {om['sel_avg']:+.3f}% в {om['sel_n']} сделках "
+                         + (f"против {om['base_avg']:+.3f}% у обычных настроек" if not self.provisional else
+                            "— итогов обычных настроек в новом режиме ещё нет, включаюсь потому что в плюсе; "
+                            "маржа пока не больше ×1, пока не обгоню обычные"))
+                        if src == "online" else
                         "Онлайн-проверки пока мало — включилась по проверке на свежем куске при переобучении",
                         "Теперь выбираю монету, все настройки сетки и маржу сама"])
         elif was and not self.active and src != "regime":
             self.think("warn", "Отключаюсь от решений",
                        [f"За последние {a.nn_eval_min:g} мин мой выбор: {om['sel_avg']:+.3f}% против {om['base_avg']:+.3f}% "
                         f"у обычных — бот торгует обычными настройками, я учусь дальше"])
-        self.status_text = "ПРИНИМАЕТ РЕШЕНИЯ" if self.active else (
+        self.status_text = ("ПРИНИМАЕТ РЕШЕНИЯ (в плюсе, маржа ≤ ×1)" if self.provisional else "ПРИНИМАЕТ РЕШЕНИЯ") if self.active else (
             "рынок сменился — изучаю новый режим" if self.regime_hold else
             "учится на ходу" if self.model is not None else self.status_text)
         if time.time() - self.last_summary >= a.nn_summary_min * 60 and self.model is not None:
@@ -1057,7 +1073,8 @@ class Brain:
         """Маржа на сетку: больше при сильном прогнозе, меньше при слабом, в пределах --nn-size-min…max."""
         if pred is None or pred <= 0:
             return self.a.nn_size_min
-        return float(min(self.a.nn_size_max, max(self.a.nn_size_min, pred / self.a.nn_size_ref)))
+        top = min(self.a.nn_size_max, 1.0) if self.provisional else self.a.nn_size_max
+        return float(min(top, max(self.a.nn_size_min, pred / self.a.nn_size_ref)))
 
     def log_decisions(self, decided, use):
         """Мысли по скану: какие настройки выбрала для каждой монеты и почему."""
@@ -1115,7 +1132,7 @@ class Brain:
                 "regime": self.regime, "regime_hold": self.regime_hold, "regime_start": self.regime_start,
                 "regime_n": n_post, "regime_need": self.a.nn_regime_min_n, "regime_since": since,
                 "regime_vol": self.a.nn_regime_vol,
-                "active": self.active, "text": self.status_text, "progress": self.progress,
+                "active": self.active, "provisional": self.provisional, "text": self.status_text, "progress": self.progress,
                 "samples": self.n(), "real": int((self.kind == 1).sum()) + sum(1 for b in self._buf if b[4] == 1),
                 "history": self.history[-600:], "curve": self.curve, "preds": self.preds[:12],
                 "min_edge": self.a.nn_min_edge, "enabled": self.a.nn,
