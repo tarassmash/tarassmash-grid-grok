@@ -426,10 +426,11 @@ class Brain:
                         "mu": self.mu.tolist() if self.mu is not None else None,
                         "sd": self.sd.tolist() if self.sd is not None else None, "features": FEATURES,
                         "thoughts": list(self.thoughts)[:200], "importance": self.importance,
-                        "trained_until": self.trained_until, "evals": list(self.evals)[-6000:]}
+                        "trained_until": self.trained_until, "evals": list(self.evals)[-6000:],
+                        "made": self.made, "pending": self.pending}
             tmp = os.path.join(self.path, "brain.json.tmp")
             with open(tmp, "w") as f:
-                json.dump(meta, f)
+                json.dump(meta, f, default=float)
             os.replace(tmp, os.path.join(self.path, "brain.json"))
             self.last_save = time.time()
         except Exception as e:  # noqa: BLE001
@@ -460,8 +461,12 @@ class Brain:
                 self.mu, self.sd = np.array(d["mu"]), np.array(d["sd"])
             self.thoughts.extend(d.get("thoughts") or [])
             self.importance = d.get("importance") or []
-            self.trained_until = float(d.get("trained_until") or 0.0)
+            # старая модель без отметки «что уже видела» — считаем, что видела всё до сейчас (честная проверка)
+            self.trained_until = float(d.get("trained_until") or time.time() * 1000)
             self.evals.extend(d.get("evals") or [])
+            # моменты рынка, созданные до перезапуска: не создаём их заново (без дублей) и дожидаемся их итога
+            self.made = {k: float(v) for k, v in (d.get("made") or {}).items()}
+            self.pending = d.get("pending") or []
             self.status_text = f"загружено {len(self.y)} примеров"
             log.info("Нейросеть: загружено %d примеров", len(self.y))
         except Exception as e:  # noqa: BLE001
