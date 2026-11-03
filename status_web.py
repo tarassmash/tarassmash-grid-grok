@@ -118,18 +118,28 @@ def render_nn(nn):
     if not nn["enabled"]:
         pill += ' <span class="nnpill off">решения выключены (--no-nn)</span>'
     om = nn.get("online") or {}
+    rg = nn.get("regime")
+    if nn.get("regime_hold"):
+        regime_txt = (f"сменился в {time.strftime('%H:%M', time.gmtime(nn['regime_start'] / 1000))} UTC — "
+                      f"итогов {nn.get('regime_n', 0)}/{nn.get('regime_need', 20)}")
+    elif rg:
+        regime_txt = f"стабильный (волат. ×{rg['vol_ratio']:.2f}, тренд {rg['er_now']:.2f})"
+    else:
+        regime_txt = "считаю…"
     em = nn.get("eval_min", 60)
-    cls = lambda v: "pos" if v > 0 else "neg"  # noqa: E731
+    def pct(v, n):
+        return f'<b class="{"pos" if v > 0 else "neg"}">{v:+.3f}%</b>' if n else '<b class="muted">ещё нет итогов</b>'
     kv = f"""<div class="kv">
       <div><span>Состояние</span><b>{escape(nn['text'])}</b></div>
       <div><span>Примеров за {nn.get('window_h', 4):g} ч</span><b>{nn['samples']:,}</b></div>
       <div><span>Реальных сеток за сутки</span><b>{nn['real']}</b></div>
       <div><span>Монет в учёбе</span><b>{nn.get('coins', 0)}</b></div>
       <div><span>Ждут итога</span><b>{nn.get('pending', 0):,}</b></div>
-      <div><span>Онлайн {em:g} мин: выбор сети</span><b class="{cls(om.get('sel_avg', 0))}">{om.get('sel_avg', 0):+.3f}%</b></div>
-      <div><span>Онлайн {em:g} мин: обычные</span><b class="{cls(om.get('base_avg', 0))}">{om.get('base_avg', 0):+.3f}%</b></div>
+      <div><span>Онлайн {em:g} мин: выбор сети</span>{pct(om.get('sel_avg', 0), om.get('sel_n', 0))}</div>
+      <div><span>Онлайн {em:g} мин: обычные</span>{pct(om.get('base_avg', 0), om.get('n', 0))}</div>
       <div><span>Сделок сети в проверке</span><b>{om.get('sel_n', 0)} из {om.get('n', 0)}</b></div>
       {f'<div><span>Ошибка на новых сетках</span><b>{nn["mae"]:.3f}%</b></div>' if nn.get("mae") is not None else ''}
+      <div><span>Режим рынка</span><b class="{'neg' if nn.get('regime_hold') else ''}">{regime_txt}</b></div>
     </div>"""
     prog = f'<p class="muted small">Сейчас: {escape(nn["progress"])}</p>' if nn["progress"] else ""
     ch1 = svg_chart([("ошибка на обучении", "var(--acc)", [c["train"] for c in curve]),
@@ -142,6 +152,10 @@ def render_nn(nn):
     ch3 = svg_chart([("ошибка прогноза на ещё не виденных сетках", "var(--warn)", [r.get("mae") for r in hist])],
                     xlabels=labels, unit="%")
     ch4 = svg_chart([("примеров в памяти", "var(--acc)", [r["samples"] for r in hist])], xlabels=labels)
+    ch5 = svg_chart([("волатильность рынка (медиана по монетам)", "var(--acc)", [r.get("vol_ratio") for r in hist]),
+                     ("порог смены рынка", "var(--neg)", [nn.get("regime_vol", 1.7) if r.get("vol_ratio") is not None else None
+                                                          for r in hist])],
+                    xlabels=labels, unit="×")
     preds = "".join(
         f"<tr><td>{escape(x['symbol'])}</td><td>{'—' if x['pred'] is None else '%+.3f%%' % x['pred']}</td>"
         f"<td>{'%+.3f%%' % x.get('pred_default', 0)}</td><td class=\"cfgcell\">{escape(x.get('cfg', ''))}</td>"
@@ -173,6 +187,7 @@ def render_nn(nn):
   <div class="panel"><h2>Ошибка прогноза на новых сетках</h2>{ch3}</div>
   <div class="panel"><h2>Полное переобучение: ошибка по эпохам</h2>{ch1}</div>
   <div class="panel"><h2>Память нейросети</h2>{ch4}</div>
+  <div class="panel"><h2>Режим рынка: волатильность 15 мин к прошлому часу</h2>{ch5}</div>
   <div class="panel"><h2>План нейросети</h2><ul class="plan">{plan}</ul>
     <h2 style="margin-top:14px">На что она опирается</h2>{imp_html}</div>
   <div class="panel" style="grid-column:1/-1"><h2>Прогнозы по текущим кандидатам</h2>

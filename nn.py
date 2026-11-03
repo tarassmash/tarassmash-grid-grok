@@ -367,6 +367,12 @@ class Brain:
         self.cnt = collections.Counter()
         self.new_since_update = 0
         self.new_err = collections.deque(maxlen=3000)  # ошибка прогноза на ещё не виденных сетках
+        self.regime = None              # текущее состояние рынка: волатильность и трендовость (медиана по монетам)
+        self.regime_hold = False        # рынок сменился — сеть не решает, пока не наберёт итоги нового режима
+        self.regime_start = 0.0         # когда сменился рынок (мс)
+        self.regime_quiet = 0.0         # до какого времени не поднимать новую тревогу
+        self.regime_retrained = True
+        self.regime_streak = 0
         self.preds = []
         self.thoughts = collections.deque(maxlen=400)
         self.importance = []
@@ -427,7 +433,9 @@ class Brain:
                         "sd": self.sd.tolist() if self.sd is not None else None, "features": FEATURES,
                         "thoughts": list(self.thoughts)[:200], "importance": self.importance,
                         "trained_until": self.trained_until, "evals": list(self.evals)[-6000:],
-                        "made": self.made, "pending": self.pending}
+                        "made": self.made, "pending": self.pending, "regime_hold": self.regime_hold,
+                        "regime_start": self.regime_start, "regime_quiet": self.regime_quiet,
+                        "regime_retrained": self.regime_retrained}
             tmp = os.path.join(self.path, "brain.json.tmp")
             with open(tmp, "w") as f:
                 json.dump(meta, f, default=float)
@@ -467,6 +475,10 @@ class Brain:
             # моменты рынка, созданные до перезапуска: не создаём их заново (без дублей) и дожидаемся их итога
             self.made = {k: float(v) for k, v in (d.get("made") or {}).items()}
             self.pending = d.get("pending") or []
+            self.regime_hold = bool(d.get("regime_hold", False))
+            self.regime_start = float(d.get("regime_start") or 0.0)
+            self.regime_quiet = float(d.get("regime_quiet") or 0.0)
+            self.regime_retrained = bool(d.get("regime_retrained", True))
             self.status_text = f"загружено {len(self.y)} примеров"
             log.info("Нейросеть: загружено %d примеров", len(self.y))
         except Exception as e:  # noqa: BLE001
@@ -503,7 +515,12 @@ class Brain:
                f"(вес вдвое меньше каждые {a.nn_half_life_min:g} мин)",
                f"Итог сетки узнаю, когда она отработает: короткой — через 20 мин, длинной — через {a.nn_max_hold} мин; "
                f"сейчас жду итог {len(self.pending):,} моментов"]
-        if not self.active:
+        if self.regime_hold:
+            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start)
+            out.append(f"Рынок сменился в {time.strftime('%H:%M UTC', time.gmtime(self.regime_start / 1000))}: "
+                       f"решает бот с обычными настройками; жду итогов своих решений в новом режиме — "
+                       f"{n_post} из {a.nn_regime_min_n}")
+        elif not self.active:
             out.append(f"Чтобы включиться: за последние {a.nn_eval_min:g} мин мой выбор по факту в плюсе и лучше "
                        f"обычных настроек, минимум {a.nn_eval_min_n} сделок")
         else:
@@ -699,9 +716,10 @@ class Brain:
         self.pending = keep
         return resolved
 
-    def online_metrics(self, now, minutes):
-        """Онлайн-проверка: что дал выбор сети по факту против обычных настроек за последние `minutes` мин."""
-        E = [e for e in self.evals if e["tr"] >= now - minutes * 60_000]
+    def online_metrics(self, now, minutes, since=None):
+        """Онлайн-проверка: что дал выбор сети по факту против обычных настроек за последние `minutes` мин.
+        since — учитывать только решения, принятые после смены рынка."""
+        E = [e for e in self.evals if e["tr"] >= now - minutes * 60_000 and (since is None or e["t"] >= since)]
         taken = [e for e in E if e["took"]]
         out = {"n": len(E), "sel_n": len(taken),
                "sel_avg": float(np.mean([e["net"] for e in taken])) if taken else 0.0,
@@ -714,6 +732,72 @@ class Brain:
                 out["corr"] = float(np.corrcoef(pr, ac)[0, 1])
         return out
 
+    # --- режим рынка
+    @staticmethod
+    def _er(c):
+        path = np.abs(np.diff(c)).sum()
+        return float(abs(c[-1] - c[0]) / path) if path > 0 else 1.0
+
+    def market_regime(self, syms):
+        """Медиана по монетам: волатильность последних 15 мин к предыдущему часу и трендовость сейчас / раньше.
+        Медиана — чтобы тревогу поднимала смена всего рынка, а не всплеск одной монеты (их и ищет сканер)."""
+        vr, en, eb = [], [], []
+        for sym in syms:
+            K = self.K.get(sym)
+            if K is None or len(K) < 90 or K[-1, 0] - K[-90, 0] != 89 * 60_000:
+                continue
+            o, h, l, c = K[-90:, 1], K[-90:, 2], K[-90:, 3], K[-90:, 4]
+            rng = (h - l) / o * 100
+            prev = rng[15:75].mean()                 # волатильность: последние 15 мин к часу перед ними
+            if prev <= 0:
+                continue
+            vr.append(rng[75:].mean() / prev)
+            en.append(self._er(c[60:]))              # трендовость: последние 30 мин к двум получасам перед ними
+            eb.append(float(np.mean([self._er(c[0:30]), self._er(c[30:60])])))
+        if len(vr) < 8:
+            return None
+        return {"vol_ratio": float(np.median(vr)), "er_now": float(np.median(en)), "er_before": float(np.median(eb)),
+                "coins": len(vr)}
+
+    def check_regime(self, now, syms):
+        a = self.a
+        r = self.market_regime(syms)
+        self.regime = r
+        if self.regime_hold:
+            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start)
+            if n_post >= a.nn_regime_min_n or now - self.regime_start >= a.nn_regime_max * 60_000:
+                self.regime_hold = False
+                self.regime_quiet = now + 10 * 60_000
+                om = self.online_metrics(now, a.nn_eval_min, since=self.regime_start)
+                self.think("decide", "Новый режим рынка изучен — возвращаю себе право решать по проверке",
+                           [f"Итогов моих решений после смены рынка: {n_post}",
+                            f"По ним мой выбор: {om['sel_avg']:+.3f}% против {om['base_avg']:+.3f}% у обычных настроек "
+                            f"({om['sel_n']} сделок)" if om["n"] else "Итогов мало — включусь только если пройду проверку",
+                            "Онлайн-проверка дальше считается только по новому режиму"])
+            return
+        if r is None or now < self.regime_quiet:
+            self.regime_streak = 0
+            return
+        vr, de = r["vol_ratio"], r["er_now"] - r["er_before"]
+        hit = vr >= a.nn_regime_vol or vr <= 1 / a.nn_regime_vol or abs(de) >= a.nn_regime_er
+        self.regime_streak = self.regime_streak + 1 if hit else 0     # сигнал должен держаться N минут подряд
+        if self.regime_streak >= a.nn_regime_confirm:
+            self.regime_streak = 0
+            self.regime_hold, self.regime_start, self.regime_retrained = True, now, False
+            what = []
+            if vr >= a.nn_regime_vol:
+                what.append(f"волатильность выросла ×{vr:.2f}")
+            elif vr <= 1 / a.nn_regime_vol:
+                what.append(f"волатильность упала до ×{vr:.2f}")
+            if abs(de) >= a.nn_regime_er:
+                what.append(f"трендовость {r['er_before']:.2f} → {r['er_now']:.2f}")
+            self.think("warn", "Рынок сменился — передаю решения обычным настройкам",
+                       [f"По {r['coins']} монетам (медиана), держится {a.nn_regime_confirm} мин подряд: " + ", ".join(what),
+                        "Мои знания о прошлом режиме могут не работать: пока решает бот с обычными настройками",
+                        f"Учу новый режим с весом ×{a.nn_regime_boost:g}; полностью переобучусь, когда наберу 300 его примеров",
+                        f"Вернусь, когда наберу минимум {a.nn_regime_min_n} итогов своих решений в новом режиме "
+                        f"(не раньше чем через 20 мин, не позже чем через {a.nn_regime_max:g} мин)"])
+
     # --- обучение
     def _arrays(self, now):
         self._flush()
@@ -722,6 +806,8 @@ class Brain:
             kind, g, dflt = self.kind.copy(), self.g.copy(), self.d.copy()
         age_min = np.maximum(0.0, (now - t) / 60_000)
         w = w * np.maximum(0.05, 0.5 ** (age_min / max(self.a.nn_half_life_min, 1)))
+        if self.regime_start and now - self.regime_start < 2 * 3_600_000:
+            w = np.where(t >= self.regime_start, w * self.a.nn_regime_boost, w)    # новый режим рынка важнее
         return X, y, w, t, kind, g, dflt
 
     def full_train(self, now):
@@ -824,6 +910,7 @@ class Brain:
         self.cnt["resolved"] += resolved
         self._flush()
         self._trim(now)
+        self.check_regime(now, syms)
         if first and resolved:
             self.think("data", "Свежий рынок загружен",
                        [f"Монет: {len(self.K)}, моментов рынка: {made:,}, сеток с известным итогом: {resolved:,}",
@@ -832,14 +919,21 @@ class Brain:
             self.status_text = f"собираю данные ({self.n()} примеров)"
         elif self.model is None or time.time() - self.last_full >= a.nn_full_every * 60:
             self.full_train(now)
+        elif self.regime_hold and not self.regime_retrained and int((self.t >= self.regime_start).sum()) >= 300:
+            self.think("train", "Набрала 300 примеров нового режима — переобучаюсь полностью")
+            self.full_train(now)
+            self.regime_retrained = True
         elif self.new_since_update >= 20:
             self.progress = "дообучаюсь"
             self.online_update(now)
         self.progress = ""
         # решение: онлайн-проверка за последний час, пока её мало — проверка при полном переобучении
-        om = self.online_metrics(now, a.nn_eval_min)
+        since = self.regime_start if self.regime_start and now - self.regime_start < a.nn_eval_min * 60_000 else None
+        om = self.online_metrics(now, a.nn_eval_min, since=since)
         was = self.active
-        if om["sel_n"] >= a.nn_eval_min_n:
+        if self.regime_hold:
+            self.active, src = False, "regime"
+        elif om["sel_n"] >= a.nn_eval_min_n:
             self.active, src = bool(om["sel_avg"] > 0 and om["sel_avg"] > om["base_avg"]), "online"
         else:
             self.active, src = self.val_active, "full"
@@ -848,7 +942,8 @@ class Brain:
             self.history.append({"time": int(now), "samples": self.n(), "real": int((self.kind == 1).sum()),
                                  "sel_avg": om["sel_avg"] if om["sel_n"] else None,
                                  "base_avg": om["base_avg"] if om["n"] else None, "sel_n": om["sel_n"],
-                                 "val_n": om["n"], "corr": om["corr"], "active": self.active, "src": src, "mae": mae})
+                                 "val_n": om["n"], "corr": om["corr"], "active": self.active, "src": src, "mae": mae,
+                                 "vol_ratio": self.regime["vol_ratio"] if self.regime else None})
             self.history = self.history[-600:]
         if self.active and not was:
             self.think("decide", "Включаюсь в принятие решений",
@@ -856,11 +951,12 @@ class Brain:
                         f"против {om['base_avg']:+.3f}% у обычных настроек" if src == "online" else
                         "Онлайн-проверки пока мало — включилась по проверке на свежем куске при переобучении",
                         "Теперь выбираю монету, все настройки сетки и маржу сама"])
-        elif was and not self.active:
+        elif was and not self.active and src != "regime":
             self.think("warn", "Отключаюсь от решений",
                        [f"За последние {a.nn_eval_min:g} мин мой выбор: {om['sel_avg']:+.3f}% против {om['base_avg']:+.3f}% "
                         f"у обычных — бот торгует обычными настройками, я учусь дальше"])
         self.status_text = "ПРИНИМАЕТ РЕШЕНИЯ" if self.active else (
+            "рынок сменился — изучаю новый режим" if self.regime_hold else
             "учится на ходу" if self.model is not None else self.status_text)
         if time.time() - self.last_summary >= a.nn_summary_min * 60 and self.model is not None:
             self.summary(now, om)
@@ -944,7 +1040,8 @@ class Brain:
                 lines.append("   почему: " + "; ".join(
                     f"{FEATURE_RU[k]} = {v:.3g} {'тянет вверх' if dlt > 0 else 'тянет вниз'} {dlt:+.3f}%" for k, dlt, v in why))
         title = (f"Выбор по скану: {'беру ' + top['symbol'] if top['take'] else 'все кандидаты в минусе — пропускаю'}"
-                 if use else "Оцениваю кандидатов (решает сканер с обычными настройками, я пока учусь)")
+                 if use else "Рынок сменился — решает сканер с обычными настройками, я изучаю новый режим"
+                 if self.regime_hold else "Оцениваю кандидатов (решает сканер с обычными настройками, я пока учусь)")
         self.think("decide", title, lines)
 
     def loop(self):
@@ -970,9 +1067,15 @@ class Brain:
 
     def status(self):
         now = time.time() * 1000
-        om = self.online_metrics(now, self.a.nn_eval_min)
+        since = (self.regime_start if self.regime_start and now - self.regime_start < self.a.nn_eval_min * 60_000
+                 else None)
+        om = self.online_metrics(now, self.a.nn_eval_min, since=since)
+        n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start) if self.regime_hold else 0
         with self.lock:
             return {
+                "regime": self.regime, "regime_hold": self.regime_hold, "regime_start": self.regime_start,
+                "regime_n": n_post, "regime_need": self.a.nn_regime_min_n, "regime_since": since,
+                "regime_vol": self.a.nn_regime_vol,
                 "active": self.active, "text": self.status_text, "progress": self.progress,
                 "samples": self.n(), "real": int((self.kind == 1).sum()) + sum(1 for b in self._buf if b[4] == 1),
                 "history": self.history[-600:], "curve": self.curve, "preds": self.preds[:12],

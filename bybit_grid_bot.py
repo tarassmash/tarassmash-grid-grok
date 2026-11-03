@@ -752,6 +752,13 @@ def main():
     p.add_argument("--nn-eval-min", type=float, default=60, help="онлайн-проверка за последние N минут")
     p.add_argument("--nn-eval-min-n", type=int, default=20, help="минимум сделок в онлайн-проверке для решения")
     p.add_argument("--nn-max-hold", type=int, default=90, help="самая долгая сетка, которую может выбрать сеть, мин")
+    p.add_argument("--nn-regime-vol", type=float, default=1.7,
+                   help="смена рынка: волатильность за 15 мин к прошлому часу больше ×X (или меньше 1/X)")
+    p.add_argument("--nn-regime-er", type=float, default=0.3, help="смена рынка: трендовость за 30 мин изменилась на X")
+    p.add_argument("--nn-regime-confirm", type=int, default=3, help="сигнал смены рынка должен держаться N минут")
+    p.add_argument("--nn-regime-min-n", type=int, default=20, help="итогов в новом режиме, чтобы сеть снова решала")
+    p.add_argument("--nn-regime-max", type=float, default=120, help="максимум минут паузы после смены рынка")
+    p.add_argument("--nn-regime-boost", type=float, default=3, help="вес примеров нового режима")
     p.add_argument("--nn-summary-min", type=float, default=10, help="сводка «учусь на ходу» в мыслях раз в N минут")
     p.add_argument("--nn-epochs", type=int, default=60, help="проходов при полном переобучении (с ранней остановкой)")
     p.add_argument("--nn-max-samples", type=int, default=150000)
