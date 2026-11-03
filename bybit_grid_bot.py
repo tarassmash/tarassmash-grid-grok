@@ -193,6 +193,7 @@ def apply_brain(res, a):
     if not BRAIN:
         return res
     out, decided = [], []
+    BRAIN.focus = [c["symbol"] for c in res]      # монеты сканера — учится на них в первую очередь
     use = a.nn and BRAIN.active
     for c in res:
         r = BRAIN.evaluate(c)
@@ -741,15 +742,19 @@ def main():
     # нейросеть
     p.add_argument("--no-nn", dest="nn", action="store_false", help="не давать нейросети принимать решения (учится всё равно)")
     p.add_argument("--nn-min-edge", type=float, default=0.02, help="брать сетку, если прогноз выше X %% от объёма")
-    p.add_argument("--nn-symbols", type=int, default=50, help="монет для учебных сеток")
-    p.add_argument("--nn-stride", type=int, default=5, help="шаг (мин) между учебными сетками на последних сутках")
-    p.add_argument("--nn-history-days", type=int, default=30, help="дней истории минутных свечей для обучения")
-    p.add_argument("--nn-history-stride", type=int, default=20, help="шаг (мин) между учебными сетками в истории")
-    p.add_argument("--nn-half-life", type=float, default=7, help="через сколько дней вес примера вдвое меньше")
-    p.add_argument("--nn-refresh", type=float, default=30, help="раз в N минут — новые учебные сетки")
-    p.add_argument("--nn-retrain-every", type=int, default=500, help="переобучать после N новых примеров")
-    p.add_argument("--nn-epochs", type=int, default=60)
-    p.add_argument("--nn-max-samples", type=int, default=300000)
+    p.add_argument("--nn-symbols", type=int, default=40, help="монет для учёбы (сначала из сканера, потом ликвидные)")
+    p.add_argument("--nn-window-hours", type=float, default=4, help="память: только последние N часов рынка")
+    p.add_argument("--nn-stride", type=int, default=1, help="новый момент рынка каждые N минут")
+    p.add_argument("--nn-half-life-min", type=float, default=60, help="через сколько минут вес примера вдвое меньше")
+    p.add_argument("--nn-full-every", type=float, default=30, help="полное переобучение раз в N минут")
+    p.add_argument("--nn-online-epochs", type=int, default=2, help="проходов при дообучении каждую минуту")
+    p.add_argument("--nn-online-lr", type=float, default=1e-3)
+    p.add_argument("--nn-eval-min", type=float, default=60, help="онлайн-проверка за последние N минут")
+    p.add_argument("--nn-eval-min-n", type=int, default=20, help="минимум сделок в онлайн-проверке для решения")
+    p.add_argument("--nn-max-hold", type=int, default=90, help="самая долгая сетка, которую может выбрать сеть, мин")
+    p.add_argument("--nn-summary-min", type=float, default=10, help="сводка «учусь на ходу» в мыслях раз в N минут")
+    p.add_argument("--nn-epochs", type=int, default=60, help="проходов при полном переобучении (с ранней остановкой)")
+    p.add_argument("--nn-max-samples", type=int, default=150000)
     p.add_argument("--nn-configs", type=int, default=3, help="случайных комбинаций настроек на каждое учебное окно")
     p.add_argument("--nn-size-min", type=float, default=0.25, help="маржа от нейросети: не меньше X × --budget")
     p.add_argument("--nn-size-max", type=float, default=2.0, help="маржа от нейросети: не больше X × --budget")
@@ -800,7 +805,7 @@ def main():
         t = [x for x in t if x["symbol"] in inst and float(x.get("turnover24h") or 0) >= a.min_vol]
         t.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
         return [x["symbol"] for x in t]
-    BRAIN = nn.Brain(a.nn_path, a, market, analyze, klines, liquid)
+    BRAIN = nn.Brain(a.nn_path, a, market, analyze, None, liquid)
     BRAIN.start()
     web.BRAIN = BRAIN
     last_bal = time.time()

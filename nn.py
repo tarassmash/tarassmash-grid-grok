@@ -1,33 +1,34 @@
-"""Встроенная нейросеть сеточного бота: учится предсказывать доходность нейтральной сетки.
+"""Встроенная нейросеть сеточного бота: учится на ходу предсказывать доходность нейтральной сетки.
 
-Откуда данные:
-  1) учебные сетки — бот сам прогоняет свою сетку по минутным свечам ликвидных монет
-     (те же правила: сдвиг за ценой, лимит позиции, стоп по убытку, комиссии): при первом запуске —
-     по истории за --nn-history-days дней (кэш на диске), дальше — по новым свечам каждые --nn-refresh минут;
-     свежие примеры весят больше старых (вес вдвое меньше каждые --nn-half-life дней);
-  2) реальные сетки — каждая закрытая сетка на бирже, с весом ×3.
+Скальпинг — значит, важен только текущий рынок:
+  - в памяти только последние --nn-window-hours часов минутных свечей (никакой старой истории);
+  - каждую минуту бот дочитывает новые свечи и создаёт «моменты рынка» по монетам из сканера и самым ликвидным;
+  - в каждый момент нейросеть сразу выбирает настройки сетки (до того, как известен итог),
+    а бот прогоняет по будущим свечам её выбор, обычные настройки и несколько случайных;
+  - как только итог сетки стал известен (через 20…90 минут — сколько сетка живёт), он идёт в обучение;
+  - дообучение каждую минуту, полное переобучение раз в --nn-full-every минут;
+  - свежие минуты важнее (вес вдвое меньше каждые --nn-half-life-min минут);
+  - реальные сетки на бирже идут в обучение с весом ×3.
 
-Что предсказывает: доходность сетки в % от объёма позиции (не зависит от маржи и плеча) за --max-minutes.
-Для каждой монеты сеть сравнивает 3 варианта шага (частый / обычный / редкий) и выбирает лучший.
-
-Честность: после обучения сеть проверяется на самых свежих примерах, которых не видела.
-Решения она принимает, только если сетки, которые она отбирает, там в плюсе и лучше обычного отбора.
+Честность (онлайн-проверка): прогноз фиксируется до итога. Решения сеть принимает, только если за последний
+час её выбор по факту в плюсе и лучше обычных настроек.
 """
 
 import collections
 import json
-import random
-import zlib
 import logging
 import math
 import os
+import random
+import shutil
 import threading
 import time
+import zlib
 
 import numpy as np
 
 log = logging.getLogger("grid")
-HORIZON_MIN = 60
+HORIZON_MIN = 90                      # самая долгая сетка, мин (скальпинг до 1.5 часа)
 # Всё, что нейросеть настраивает в сетке. Сеть оценивает каждую комбинацию и берёт лучшую.
 CONFIG_SPACE = {
     "mult": [0.6, 1.0, 1.6, 2.5],     # шаг: ×0.6 частая … ×2.5 очень редкая (уровней меньше)
@@ -36,7 +37,7 @@ CONFIG_SPACE = {
     "lotk": [1.0, 1.2, 1.5],          # рост лота на каждый уровень от цены
     "shift": [1, 2, 4],               # идти за ценой, когда она дальше края на N шагов
     "stop": [3, 6, 10],               # стоп по убытку, % от объёма позиции
-    "hold": [20, 40, 60],             # сколько минут держать сетку
+    "hold": [20, 40, 60, 90],         # сколько минут держать сетку
 }
 CONFIG_KEYS = list(CONFIG_SPACE)
 MARKET = ["vol1m", "atr", "er", "width", "log_turnover", "ret_win", "ret_5", "pos_range", "atr_trend"]
@@ -67,6 +68,32 @@ def default_cfg(a):
     return {"mult": 1.0, "wmult": 1.0, "geo": 0, "lotk": 1.0, "shift": float(a.shift_steps),
             "stop": round(a.max_loss / max(a.leverage, 1), 4) if a.max_loss > 0 else 100.0,
             "hold": float(min(HORIZON_MIN, a.max_minutes))}
+
+
+CFG_ARR = np.array([[c[k] for k in CONFIG_KEYS] for c in ALL_CONFIGS], float)
+FIDX = {k: i for i, k in enumerate(FEATURES)}
+
+
+def feature_matrix(base, cfg_idx, max_levels):
+    """Признаки сразу для многих комбинаций настроек (то же, что variant(), но быстро)."""
+    C = CFG_ARR[cfg_idx]
+    levels = np.clip(np.round(base["grids"] / C[:, CONFIG_KEYS.index("mult")]), 2, max_levels)
+    X = np.empty((len(C), len(FEATURES)))
+    for k in MARKET:
+        X[:, FIDX[k]] = base[k]
+    X[:, FIDX["levels"]] = levels / 40.0
+    X[:, FIDX["step"]] = base["width"] * C[:, CONFIG_KEYS.index("wmult")] / levels
+    for j, k in enumerate(CONFIG_KEYS):
+        X[:, FIDX[k]] = C[:, j]
+    return X, levels.astype(int)
+
+
+def grid_bounds(lower, upper, wmult):
+    """Границы сетки с учётом множителя ширины — так же, как в боте."""
+    if wmult == 1.0:
+        return lower, upper
+    mid = (lower + upper) / 2
+    return max(mid - (mid - lower) * wmult, mid * 0.5), mid + (upper - mid) * wmult
 
 
 def cfg_short(cfg, levels=None):
@@ -226,8 +253,14 @@ class MLP:
     def predict(self, X):
         return self.forward(X)[-1][:, 0]
 
+    def copy(self):
+        m = MLP.__new__(MLP)
+        m.W = [W.copy() for W in self.W]
+        m.b = [b.copy() for b in self.b]
+        return m
+
     def fit(self, X, y, w, Xv, yv, epochs=60, lr=2e-3, batch=256, l2=5e-4, delta=1.0, seed=0, on_epoch=None,
-            patience=12):
+            patience=12, restore_best=True):
         """Adam + Huber loss. Возвращает кривые ошибки по эпохам; оставляет лучшие по проверке веса.
         Ранняя остановка: если проверка не улучшалась `patience` эпох — дальше не учимся (это заучивание шума)."""
         rng = np.random.default_rng(seed)
@@ -277,7 +310,7 @@ class MLP:
                 on_epoch(ep + 1, epochs)
             if patience and since_best >= patience:
                 break
-        if best[1]:
+        if restore_best and best[1]:
             self.W, self.b = best[1]
         return curve
 
@@ -292,45 +325,58 @@ class MLP:
         return m
 
 
-# ---------------------------------------------------------------- «мозг»: данные, обучение, решения
+# ---------------------------------------------------------------- «мозг»: учёба на ходу, решения
 
 class Brain:
-    def __init__(self, path, a, market, analyze_fn, klines_fn, symbols_fn):
+    def __init__(self, path, a, market, analyze_fn, klines_fn=None, symbols_fn=None):
         self.path = path
         self.a = a
         self.market = market            # HTTP-клиент для рыночных данных (pybit, реальный рынок)
         self.analyze = analyze_fn
-        self.klines = klines_fn
-        self.symbols = symbols_fn       # () -> список ликвидных монет
+        self.symbols = symbols_fn or (lambda: [])
         self.lock = threading.RLock()
         nf = len(FEATURES)
-        # данные в numpy: сотни тысяч примеров занимают десятки МБ, а не гигабайты
         self.X = np.zeros((0, nf), np.float32)
         self.y = np.zeros(0, np.float32)
         self.w = np.zeros(0, np.float32)
         self.t = np.zeros(0, np.float64)
         self.kind = np.zeros(0, np.int8)            # 0 учебная, 1 реальная
-        self.g = np.zeros(0, np.int64)              # номер окна рынка: варианты настроек одного момента
-        self.d = np.zeros(0, np.int8)               # 1 = обычные настройки (без нейросети)
+        self.g = np.zeros(0, np.int64)              # номер момента рынка
+        self.d = np.zeros(0, np.int8)               # 1 обычные настройки, 2 выбор сети, 0 случайные
         self._buf = []
         self.rng = random.Random(7)
-        self.covered = {}               # монета -> время последней разобранной учебной сетки
-        self.hist_dir = os.path.join(path, "hist")
-        self.hist = {"symbols": 0, "candles": 0, "days": 0.0}
+        self.allowed = np.array([i for i, c in enumerate(ALL_CONFIGS) if c["hold"] <= a.nn_max_hold])
+        self.K = {}                     # монета -> минутные свечи (n, 7) за последние часы
+        self.made = {}                  # монета -> время последнего созданного момента
+        self.pending = []               # моменты рынка, итог которых ещё не известен
+        self.evals = collections.deque(maxlen=50000)   # онлайн-проверка: выбор сети vs обычные, по факту
+        self.focus = []                 # монеты из последнего скана — учусь в первую очередь на них
+        self._liquid = ([], 0.0)
         self.model, self.mu, self.sd = None, None, None
+        self.trained_until = 0.0        # самое свежее время, которое модель уже видела
         self.active = False
-        self.history = []               # запуски обучения
-        self.curve = []                 # кривая последнего обучения
+        self.val_active = False
+        self.history = []               # шаги обучения (раз в минуту)
+        self.curve = []                 # кривая последнего полного переобучения
         self.status_text = "загрузка"
         self.progress = ""
-        self.last_boot = 0
-        self.last_train_n = 0
-        self.preds = []                 # прогнозы по последним кандидатам
-        self.thoughts = collections.deque(maxlen=400)   # журнал мыслей: что делает, почему, что дальше
+        self.last_full = 0.0
+        self.last_step = 0.0
+        self.last_save = 0.0
+        self.last_summary = time.time()
+        self.cnt = collections.Counter()
+        self.new_since_update = 0
+        self.new_err = collections.deque(maxlen=3000)  # ошибка прогноза на ещё не виденных сетках
+        self.preds = []
+        self.thoughts = collections.deque(maxlen=400)
         self.importance = []
         self._last_decision = ("", 0.0)
-        os.makedirs(self.hist_dir, exist_ok=True)
+        os.makedirs(path, exist_ok=True)
         self.load()
+        old = os.path.join(path, "hist")
+        self.removed_hist = os.path.isdir(old)
+        if self.removed_hist:
+            shutil.rmtree(old, ignore_errors=True)   # кэш месячной истории больше не нужен
 
     # --- хранение
     def n(self):
@@ -350,18 +396,21 @@ class Brain:
             self.g = np.concatenate([self.g, np.array(gs, np.int64)])
             self.d = np.concatenate([self.d, np.array(ds, np.int8)])
 
-    def _trim(self):
-        """Оставляем самые свежие --nn-max-samples примеров; реальные сетки не выбрасываем никогда."""
+    def _trim(self, now):
+        """Только свежий рынок: учебные примеры — за последние --nn-window-hours часов, реальные сетки — за сутки."""
         with self.lock:
+            keep = ((self.t >= now - self.a.nn_window_hours * 3_600_000) |
+                    ((self.kind == 1) & (self.t >= now - 86_400_000)))
+            if len(keep) - keep.sum() > 0:
+                self.X, self.y, self.w, self.t, self.kind, self.g, self.d = (
+                    self.X[keep], self.y[keep], self.w[keep], self.t[keep], self.kind[keep], self.g[keep], self.d[keep])
             cap = self.a.nn_max_samples
-            if len(self.y) <= cap:
-                return
-            real = np.where(self.kind == 1)[0]
-            other = np.where(self.kind != 1)[0]
-            keep_other = other[np.argsort(self.t[other])][-(cap - len(real)):]
-            keep = np.sort(np.concatenate([real, keep_other]))
-            self.X, self.y, self.w, self.t, self.kind, self.g, self.d = (
-                self.X[keep], self.y[keep], self.w[keep], self.t[keep], self.kind[keep], self.g[keep], self.d[keep])
+            if len(self.y) > cap:
+                order = np.argsort(self.t)[-cap:]
+                order.sort()
+                self.X, self.y, self.w, self.t, self.kind, self.g, self.d = (
+                    self.X[order], self.y[order], self.w[order], self.t[order], self.kind[order], self.g[order],
+                    self.d[order])
 
     def save(self):
         try:
@@ -371,16 +420,18 @@ class Brain:
                 with open(tmp, "wb") as f:
                     np.savez_compressed(f, X=self.X, y=self.y, w=self.w, t=self.t, kind=self.kind, g=self.g, d=self.d)
                 os.replace(tmp, os.path.join(self.path, "data.npz"))
-                meta = {"history": self.history[-300:], "curve": self.curve, "active": self.active,
+                meta = {"history": self.history[-600:], "curve": self.curve, "active": self.active,
+                        "val_active": self.val_active,
                         "model": self.model.to_json() if self.model else None,
                         "mu": self.mu.tolist() if self.mu is not None else None,
                         "sd": self.sd.tolist() if self.sd is not None else None, "features": FEATURES,
-                        "covered": self.covered, "thoughts": list(self.thoughts)[:200],
-                        "importance": self.importance, "last_train_n": self.last_train_n, "hist": self.hist}
+                        "thoughts": list(self.thoughts)[:200], "importance": self.importance,
+                        "trained_until": self.trained_until, "evals": list(self.evals)[-6000:]}
             tmp = os.path.join(self.path, "brain.json.tmp")
             with open(tmp, "w") as f:
                 json.dump(meta, f)
             os.replace(tmp, os.path.join(self.path, "brain.json"))
+            self.last_save = time.time()
         except Exception as e:  # noqa: BLE001
             log.warning("Нейросеть: не сохранилась: %s", e)
 
@@ -397,21 +448,22 @@ class Brain:
             log.info("Нейросеть: признаки изменились — начинаю обучение заново")
             return
         try:
-            if os.path.exists(os.path.join(self.path, "data.npz")):
-                z = np.load(os.path.join(self.path, "data.npz"))
+            f = os.path.join(self.path, "data.npz")
+            if os.path.exists(f):
+                z = np.load(f)
                 self.X, self.y, self.w, self.t, self.kind = z["X"], z["y"], z["w"], z["t"], z["kind"]
                 self.g, self.d = z["g"], z["d"]
-            self.history, self.curve, self.active = d.get("history", []), d.get("curve", []), d.get("active", False)
+            self.history = [h for h in d.get("history", []) if "src" in h]
+            self.curve = d.get("curve", [])
             if d.get("model"):
                 self.model = MLP.from_json(d["model"])
                 self.mu, self.sd = np.array(d["mu"]), np.array(d["sd"])
-            self.covered = d.get("covered") or {}
             self.thoughts.extend(d.get("thoughts") or [])
             self.importance = d.get("importance") or []
-            self.last_train_n = d.get("last_train_n", len(self.y))
-            self.hist = d.get("hist") or self.hist
+            self.trained_until = float(d.get("trained_until") or 0.0)
+            self.evals.extend(d.get("evals") or [])
             self.status_text = f"загружено {len(self.y)} примеров"
-            log.info("Нейросеть: загружено %d примеров, модель %s", len(self.y), "активна" if self.active else "учится")
+            log.info("Нейросеть: загружено %d примеров", len(self.y))
         except Exception as e:  # noqa: BLE001
             log.warning("Нейросеть: данные не прочитаны (%s) — начинаю заново", e)
 
@@ -430,97 +482,29 @@ class Brain:
         base = float(self.model.predict(x)[0])
         X = np.repeat(x, len(FEATURES), axis=0)
         for k in range(len(FEATURES)):
-            X[k, k] = 0.0       # 0 после нормировки = среднее значение
+            X[k, k] = 0.0
         deltas = base - self.model.predict(X)
         order = np.argsort(-np.abs(deltas))[:3]
         return [(FEATURES[k], float(deltas[k]), float(f[FEATURES[k]])) for k in order]
 
     def plan_lines(self):
-        nxt_boot = self.last_boot + self.a.nn_refresh * 60
-        need = max(0, self.a.nn_retrain_every - (self.n() - self.last_train_n))
-        out = [f"Следующий сбор учебных сеток: ~{time.strftime('%H:%M UTC', time.gmtime(nxt_boot))}"
-               if self.last_boot else "Сбор учебных сеток: сейчас",
-               f"Переобучение: после ещё {need} новых примеров (обычно сразу после сбора)",
-               f"История: {self.hist.get('symbols', 0)} монет, {self.hist.get('days', 0):.0f} дн. минутных свечей; "
-               f"свежие дни важнее старых (вес вдвое меньше каждые {self.a.nn_half_life:g} дн.)"]
+        a = self.a
+        nxt_full = self.last_full + a.nn_full_every * 60
+        out = ["Каждую минуту: дочитываю свежие свечи, фиксирую свой выбор в новых моментах рынка и дообучаюсь "
+               "на сетках, итог которых только что стал известен",
+               (f"Полное переобучение: ~{time.strftime('%H:%M UTC', time.gmtime(nxt_full))} (раз в {a.nn_full_every:g} мин)"
+                if self.last_full else "Полное переобучение: как только наберу 300 примеров"),
+               f"Память: только последние {a.nn_window_hours:g} ч рынка; свежие минуты важнее "
+               f"(вес вдвое меньше каждые {a.nn_half_life_min:g} мин)",
+               f"Итог сетки узнаю, когда она отработает: короткой — через 20 мин, длинной — через {a.nn_max_hold} мин; "
+               f"сейчас жду итог {len(self.pending):,} моментов"]
         if not self.active:
-            out.append("Чтобы включиться, мои сетки на проверке должны быть в плюсе и лучше всех сеток сканера, "
-                       "и таких сеток должно быть не меньше 30")
+            out.append(f"Чтобы включиться: за последние {a.nn_eval_min:g} мин мой выбор по факту в плюсе и лучше "
+                       f"обычных настроек, минимум {a.nn_eval_min_n} сделок")
         else:
-            out.append("Сейчас я выбираю монету и шаг сетки; если на проверке стану хуже сканера — сама отключусь")
+            out.append("Сейчас я выбираю монету, все настройки сетки и маржу; если онлайн-проверка станет хуже "
+                       "обычных настроек — сама отключусь")
         return out
-
-    # --- данные
-    def add(self, feats, target, kind, t_ms, weight, g=0, d=0):
-        with self.lock:
-            self._buf.append((vec(feats), float(max(-10.0, min(10.0, target))), float(weight), float(t_ms), kind,
-                              int(g), int(d)))
-
-    def add_real(self, feats, target, pred=None, sym=""):
-        """Закрытая сетка на бирже: доходность в % от объёма позиции."""
-        if not feats:
-            return
-        self.add(feats, target, 1, time.time() * 1000, 3.0, g=-int(time.time() * 1000), d=1)
-        lines = [f"Итог: {target:+.3f}% от объёма позиции"]
-        if pred is not None:
-            err = target - pred
-            lines.append(f"Мой прогноз был {pred:+.3f}% — ошиблась на {err:+.3f}% "
-                         + ("(оказалось лучше, чем думала)" if err > 0 else "(оказалось хуже, чем думала)"))
-        else:
-            lines.append("Прогноза не было — сетку выбрал сканер, пока я училась")
-        self._flush()
-        lines.append(f"Запомнила с весом ×3. Реальных сеток в памяти: {int((self.kind == 1).sum())}")
-        self.think("result", f"{sym}: разбираю закрытую реальную сетку", lines)
-        self.save()
-
-    def _kline_page(self, sym, start, end):
-        for i in range(4):
-            try:
-                r = self.market.get_kline(category="linear", symbol=sym, interval="1", limit=1000,
-                                          start=int(start), end=int(end))
-                return r["result"]["list"]
-            except Exception as e:  # noqa: BLE001
-                if i == 3:
-                    raise
-                log.warning("Нейросеть: свечи %s (%s), повтор", sym, str(e)[:100])
-                time.sleep(1.5 * (i + 1))
-
-    def _fetch(self, sym, start, end):
-        """Минутные свечи [start, end] постранично (Bybit отдаёт до 1000 за раз, новые первыми)."""
-        rows = []
-        while end >= start:
-            lst = self._kline_page(sym, start, end)
-            if not lst:
-                break
-            rows.extend(lst)
-            oldest = int(lst[-1][0])
-            if oldest <= start or len(lst) < 1000:
-                break
-            end = oldest - 1
-            time.sleep(0.04)
-        if not rows:
-            return np.zeros((0, 7))
-        return np.array([[float(x) for x in k[:7]] for k in rows])
-
-    def candles(self, sym):
-        """Свечи монеты за --nn-history-days: кэш на диске + докачка недостающего. Массив (n, 7) от старых к новым."""
-        f = os.path.join(self.hist_dir, sym + ".npy")
-        now = time.time() * 1000
-        start = now - self.a.nn_history_days * 86_400_000
-        arr = np.load(f) if os.path.exists(f) else np.zeros((0, 7))
-        arr = arr[arr[:, 0] >= start] if len(arr) else arr
-        parts = [arr]
-        if not len(arr) or arr[0, 0] > start + 3_600_000:          # не хватает старой истории
-            parts.append(self._fetch(sym, start, (arr[0, 0] - 1) if len(arr) else now))
-        if len(arr):                                                 # докачка новых свечей
-            parts.append(self._fetch(sym, arr[-1, 0] + 60_000, now))
-        arr = np.concatenate([p for p in parts if len(p)]) if any(len(p) for p in parts) else np.zeros((0, 7))
-        if len(arr):
-            _, idx = np.unique(arr[:, 0], return_index=True)
-            arr = arr[idx]
-            arr = arr[arr[:, 0] + 60_000 <= now]                     # только закрытые свечи
-        np.save(f, arr)
-        return arr
 
     @staticmethod
     def setting_effects(X, y):
@@ -543,121 +527,202 @@ class Brain:
                 out.append(f"{names[k]}{label} ({m:+.3f}%)")
         return out
 
-    def bootstrap(self):
-        """Учебные сетки по минутным свечам: при первом запуске — вся история за --nn-history-days,
-        дальше — только новые свечи. Возвращает число новых примеров."""
-        a = self.a
-        syms = self.symbols()[: a.nn_symbols]
-        H = min(HORIZON_MIN, int(a.max_minutes))
-        win = a.window + 1
-        first = not self.covered
-        if first:
-            self.think("data", f"Загружаю историю: {a.nn_history_days} дн. минутных свечей по {len(syms)} монетам",
-                       ["Первая загрузка займёт несколько минут — Bybit отдаёт по 1000 свечей за запрос",
-                        f"По истории ставлю учебную сетку каждые {a.nn_history_stride} мин., по последним суткам — "
-                        f"каждые {a.nn_stride} мин.; на каждую — 3 варианта шага, итог через {H} мин."])
+    # --- данные
+    def add(self, feats, target, kind, t_ms, weight, g=0, d=0):
+        with self.lock:
+            self._buf.append((vec(feats), float(max(-10.0, min(10.0, target))), float(weight), float(t_ms), kind,
+                              int(g), int(d)))
+            self.new_since_update += 1
+
+    def add_real(self, feats, target, pred=None, sym=""):
+        """Закрытая сетка на бирже: доходность в % от объёма позиции."""
+        if not feats:
+            return
+        self.add(feats, target, 1, time.time() * 1000, 3.0, g=-int(time.time() * 1000), d=1)
+        lines = [f"Итог: {target:+.3f}% от объёма позиции"]
+        if pred is not None:
+            err = target - pred
+            lines.append(f"Мой прогноз был {pred:+.3f}% — ошиблась на {err:+.3f}% "
+                         + ("(оказалось лучше, чем думала)" if err > 0 else "(оказалось хуже, чем думала)"))
         else:
-            self.think("data", f"Дочитываю новые свечи по {len(syms)} монетам",
-                       [f"Учебная сетка каждые {a.nn_stride} мин. свежего рынка, 3 варианта шага, итог через {H} мин."])
-        n0 = self.n()
-        now = time.time() * 1000
-        total_candles, oldest = 0, now
-        dflt = default_cfg(a)
-        for si, sym in enumerate(syms):
-            self.progress = f"{'история' if first else 'новые свечи'}: {sym} ({si + 1}/{len(syms)})"
-            try:
-                KL = self.candles(sym)
-            except Exception as e:  # noqa: BLE001
-                log.warning("Нейросеть: свечи %s: %s", sym, e)
-                continue
-            n = len(KL)
-            total_candles += n
-            if n:
-                oldest = min(oldest, KL[0, 0])
-            if n < win + H:
-                continue
-            tm = KL[:, 0]
-            last = self.covered.get(sym, 0)
-            for end in range(win, n - H + 1):
-                t_end = tm[end - 1]
-                if t_end <= last:
-                    continue
-                stride = a.nn_stride if now - t_end < 86_400_000 else a.nn_history_stride
-                if int(t_end // 60_000) % stride:
-                    continue
-                if tm[end + H - 1] - tm[end - win] != (win + H - 1) * 60_000:
-                    continue                                         # дыра в свечах — пропускаем
-                window = KL[end - win:end]
-                m = self.analyze(window, a)
-                if not m or m["vol1m"] < a.min_1m * 0.3:
-                    continue
-                base = base_features(window, m)
-                fut = KL[end:end + H, 1:5]
-                gid = int(t_end // 60_000) * 65536 + (zlib.crc32(sym.encode()) & 0xFFFF)
-                # обычные настройки + несколько случайных комбинаций: сеть учится, как каждая настройка
-                # меняет итог, и потом оценивает все 1944 комбинации без перебора на истории
-                cfgs = [dflt] + self.rng.sample(ALL_CONFIGS, a.nn_configs)
-                for ci, cfg in enumerate(cfgs):
-                    f, levels = variant(base, cfg, a.max_levels)
-                    lo, hi = m["lower"], m["upper"]
-                    if cfg["wmult"] != 1.0:
-                        mid = (lo + hi) / 2
-                        lo, hi = max(mid - (mid - lo) * cfg["wmult"], mid * 0.5), mid + (hi - mid) * cfg["wmult"]
-                    r = simulate_grid(fut, m["price"], lo, hi, levels, a.fee, a.leverage, 0, cfg["shift"],
-                                      geo=bool(cfg["geo"]), lotk=cfg["lotk"], stop_pct=cfg["stop"], hold=cfg["hold"])
-                    self.add(f, r, 0, t_end, 1.0, g=gid, d=1 if ci == 0 else 0)
-            self.covered[sym] = max(last, float(tm[n - H]))
-        self.hist = {"symbols": len(syms), "candles": int(total_candles), "days": (now - oldest) / 86_400_000}
+            lines.append("Прогноза не было — сетку ставил бот с обычными настройками")
         self._flush()
-        self._trim()
-        self.last_boot = time.time()
-        added = self.n() - n0
-        if added > 0:
-            with self.lock:
-                yn = self.y[-added:].astype(float)
-                Xn = self.X[-added:].astype(float)
-            lines = [f"Новых примеров: {added:,}. Прибыльных: {(yn > 0).mean() * 100:.0f}%, средний итог {yn.mean():+.3f}%"]
-            if first:
-                lines.insert(0, f"История: {total_candles:,} минутных свечей за {self.hist['days']:.0f} дн.")
-            with self.lock:
-                dn = self.d[-added:]
-            if (dn == 1).any():
-                lines.append(f"Обычные настройки: в среднем {yn[dn == 1].mean():+.3f}%, в плюсе {(yn[dn == 1] > 0).mean() * 100:.0f}%")
-            lines.append("Что лучше шло на этих данных: " + "; ".join(self.setting_effects(Xn, yn)))
-            ercol = Xn[:, FEATURES.index("er")]
-            lo, hi = yn[ercol < 0.3], yn[ercol >= 0.3]
-            if len(lo) and len(hi):
-                lines.append(f"Боковик (ER < 0.3): {lo.mean():+.3f}%, трендовее (ER ≥ 0.3): {hi.mean():+.3f}%")
-            lines.append(f"Всего в памяти: {self.n():,} примеров")
-            self.think("data", "История загружена" if first else "Учебные сетки собраны", lines)
-        else:
-            self.think("data", "Новых учебных сеток нет", ["Новые свечи ещё не накопились — жду"])
-        return added
+        lines.append(f"Учу сразу, с весом ×3. Реальных сеток за сутки: {int((self.kind == 1).sum())}")
+        self.think("result", f"{sym}: разбираю закрытую реальную сетку", lines)
+
+    def _kline_page(self, sym, start, end):
+        for i in range(4):
+            try:
+                r = self.market.get_kline(category="linear", symbol=sym, interval="1", limit=1000,
+                                          start=int(start), end=int(end))
+                return r["result"]["list"]
+            except Exception as e:  # noqa: BLE001
+                if i == 3:
+                    raise
+                log.warning("Нейросеть: свечи %s (%s), повтор", sym, str(e)[:100])
+                time.sleep(1.0 * (i + 1))
+
+    def _fetch(self, sym, start, end):
+        """Минутные свечи [start, end] постранично (Bybit отдаёт до 1000 за раз, новые первыми)."""
+        rows = []
+        while end >= start:
+            lst = self._kline_page(sym, start, end)
+            if not lst:
+                break
+            rows.extend(lst)
+            oldest = int(lst[-1][0])
+            if oldest <= start or len(lst) < 1000:
+                break
+            end = oldest - 1
+        if not rows:
+            return np.zeros((0, 7))
+        return np.array([[float(x) for x in k[:7]] for k in rows])
+
+    def learn_symbols(self):
+        """Монеты для учёбы: сначала те, что сейчас дал сканер, потом самые ликвидные."""
+        now = time.time()
+        if now - self._liquid[1] > 600:
+            try:
+                self._liquid = (self.symbols(), now)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Нейросеть: список монет: %s", e)
+        return list(dict.fromkeys(list(self.focus) + list(self._liquid[0])))[: self.a.nn_symbols]
+
+    def refresh_candles(self, sym, now):
+        a = self.a
+        keep_min = a.nn_window_hours * 60 + HORIZON_MIN + a.window + 10
+        start = now - keep_min * 60_000
+        K = self.K.get(sym)
+        frm = start if K is None or not len(K) else K[-1, 0] + 60_000
+        if frm <= now - 60_000:
+            new = self._fetch(sym, frm, now)
+            if len(new):
+                K = new if K is None or not len(K) else np.concatenate([K, new])
+        if K is None:
+            K = np.zeros((0, 7))
+        if len(K):
+            _, idx = np.unique(K[:, 0], return_index=True)
+            K = K[idx]
+            K = K[(K[:, 0] >= start) & (K[:, 0] + 60_000 <= now)]       # только закрытые свечи
+        self.K[sym] = K
+
+    def make_moments(self, sym, now, model):
+        """Новые моменты рынка по монете. В каждом сеть сразу фиксирует свой выбор (до того, как известен итог)."""
+        a = self.a
+        K = self.K.get(sym)
+        win = a.window + 1
+        if K is None or len(K) < win:
+            return 0
+        tm = K[:, 0]
+        start_e = max(win, int(np.searchsorted(tm, self.made.get(sym, 0), side="right")) + 1)
+        oldest = now - a.nn_window_hours * 3_600_000
+        dflt = default_cfg(a)
+        mdl, mu, sd = model
+        made = 0
+        for e in range(start_e, len(K) + 1):
+            t_end = tm[e - 1]
+            if t_end < oldest or int(t_end // 60_000) % a.nn_stride:
+                continue
+            if tm[e - 1] - tm[e - win] != (win - 1) * 60_000:
+                continue
+            window = K[e - win:e]
+            m = self.analyze(window, a)
+            if not m or m["vol1m"] < a.min_1m * 0.3:
+                continue
+            base = base_features(window, m)
+            items = [{"cfg": dflt, "flag": 1}]
+            items += [{"cfg": ALL_CONFIGS[i], "flag": 0} for i in self.rng.sample(list(self.allowed), a.nn_configs)]
+            rec = {"sym": sym, "t": float(t_end), "gid": int(t_end // 60_000) * 65536 + (zlib.crc32(sym.encode()) & 0xFFFF),
+                   "price": m["price"], "lower": m["lower"], "upper": m["upper"], "base": base, "items": items,
+                   "chosen": None, "pred": None, "took": None}
+            if mdl is not None and t_end > self.trained_until:
+                X, _ = feature_matrix(base, self.allowed, a.max_levels)
+                p = mdl.predict((X - mu) / sd)
+                k = int(np.argmax(p))
+                cfg = ALL_CONFIGS[int(self.allowed[k])]
+                rec["pred"], rec["took"] = float(p[k]), bool(p[k] > a.nn_min_edge)
+                if cfg == dflt:
+                    rec["chosen"] = 0
+                else:
+                    items.append({"cfg": cfg, "flag": 2})
+                    rec["chosen"] = len(items) - 1
+            self.pending.append(rec)
+            made += 1
+        self.made[sym] = float(tm[-1])
+        return made
+
+    def resolve(self, now):
+        """Итоги, которые уже известны: прогоняем сетки по свечам после момента и учим."""
+        a = self.a
+        keep, resolved = [], 0
+        mdl = self.model
+        for rec in self.pending:
+            K = self.K.get(rec["sym"])
+            if K is not None and len(K):
+                tm = K[:, 0]
+                i0 = int(np.searchsorted(tm, rec["t"] + 60_000))
+                for it in rec["items"]:
+                    if "r" in it:
+                        continue
+                    h = int(it["cfg"]["hold"])
+                    if i0 + h > len(K):
+                        continue
+                    if tm[i0] != rec["t"] + 60_000 or tm[i0 + h - 1] - tm[i0] != (h - 1) * 60_000:
+                        it["r"] = None            # дыра в свечах
+                        continue
+                    cfg = it["cfg"]
+                    f, levels = variant(rec["base"], cfg, a.max_levels)
+                    lo, hi = grid_bounds(rec["lower"], rec["upper"], cfg["wmult"])
+                    r = simulate_grid(K[i0:i0 + h, 1:5], rec["price"], lo, hi, levels, a.fee, a.leverage, 0,
+                                      cfg["shift"], geo=bool(cfg["geo"]), lotk=cfg["lotk"], stop_pct=cfg["stop"],
+                                      hold=h)
+                    it["r"] = r
+                    if mdl is not None and rec["t"] > self.trained_until:
+                        pz = float(mdl.predict((np.array([vec(f)]) - self.mu) / self.sd)[0])
+                        self.new_err.append(abs(pz - r))
+                    self.add(f, r, 0, rec["t"], 1.0, g=rec["gid"], d=it["flag"])
+                    resolved += 1
+            if all("r" in it for it in rec["items"]):
+                c = rec["chosen"]
+                if c is not None and rec["items"][c]["r"] is not None and rec["items"][0]["r"] is not None:
+                    ch = rec["items"][c]
+                    self.evals.append({"t": rec["t"], "tr": now, "sym": rec["sym"], "took": rec["took"],
+                                       "net": ch["r"], "dflt": rec["items"][0]["r"], "pred": rec["pred"]})
+                    self.cnt["evals"] += 1
+            elif now - rec["t"] <= (HORIZON_MIN + 30) * 60_000:
+                keep.append(rec)
+        self.pending = keep
+        return resolved
+
+    def online_metrics(self, now, minutes):
+        """Онлайн-проверка: что дал выбор сети по факту против обычных настроек за последние `minutes` мин."""
+        E = [e for e in self.evals if e["tr"] >= now - minutes * 60_000]
+        taken = [e for e in E if e["took"]]
+        out = {"n": len(E), "sel_n": len(taken),
+               "sel_avg": float(np.mean([e["net"] for e in taken])) if taken else 0.0,
+               "base_avg": float(np.mean([e["dflt"] for e in E])) if E else 0.0,
+               "policy": float(np.mean([e["net"] if e["took"] else 0.0 for e in E])) if E else 0.0, "corr": 0.0}
+        if len(E) > 5:
+            pr = np.array([e["pred"] for e in E])
+            ac = np.array([e["net"] for e in E])
+            if pr.std() > 0 and ac.std() > 0:
+                out["corr"] = float(np.corrcoef(pr, ac)[0, 1])
+        return out
 
     # --- обучение
-    def train(self):
+    def _arrays(self, now):
         self._flush()
         with self.lock:
-            X = self.X.astype(float)
-            y = self.y.astype(float)
-            w = self.w.astype(float)
-            t = self.t.copy()
-            kind = self.kind.copy()
-            g = self.g.copy()
-            dflt = self.d.copy()
-        if len(y) < 300:
-            self.status_text = f"мало данных ({len(y)} примеров), жду"
-            self.think("plan", "Мало данных для обучения", [f"Есть {len(y)} примеров, нужно хотя бы 300"] + self.plan_lines())
-            return
-        self.think("train", f"Начинаю обучение №{len(self.history) + 1}",
-                   [f"Примеров: {len(y):,}, из них реальных сеток: {int((kind == 1).sum())}",
-                    "Самые свежие 20% по времени отложу для проверки — их я не увижу при обучении",
-                    f"Свежие примеры важнее: вес вдвое меньше каждые {self.a.nn_half_life:g} дн.",
-                    f"До {self.a.nn_epochs} проходов; остановлюсь раньше, если проверка 12 проходов не улучшается"])
+            X, y, w, t = self.X.astype(float), self.y.astype(float), self.w.astype(float), self.t.copy()
+            kind, g, dflt = self.kind.copy(), self.g.copy(), self.d.copy()
+        age_min = np.maximum(0.0, (now - t) / 60_000)
+        w = w * np.maximum(0.05, 0.5 ** (age_min / max(self.a.nn_half_life_min, 1)))
+        return X, y, w, t, kind, g, dflt
+
+    def full_train(self, now):
+        X, y, w, t, kind, g, dflt = self._arrays(now)
         order = np.argsort(t, kind="stable")
         X, y, w, t, kind, g, dflt = X[order], y[order], w[order], t[order], kind[order], g[order], dflt[order]
-        age_days = (t.max() - t) / 86_400_000
-        w = w * np.maximum(0.1, 0.5 ** (age_days / max(self.a.nn_half_life, 0.1)))
         n_val = max(100, int(len(y) * 0.2))
         Xt, yt, wt = X[:-n_val], y[:-n_val], w[:-n_val]
         Xv, yv = X[-n_val:], y[-n_val:]
@@ -665,41 +730,24 @@ class Brain:
         model = MLP(X.shape[1], seed=len(self.history))
 
         def prog(ep, n):
-            self.progress = f"обучение: эпоха {ep}/{n}"
-        batch = 256 if len(yt) < 50_000 else 1024
+            self.progress = f"полное переобучение: эпоха {ep}/{n}"
+        batch = 256 if len(yt) < 30_000 else 1024
         curve = model.fit((Xt - mu) / sd, yt, wt, (Xv - mu) / sd, yv, epochs=self.a.nn_epochs, batch=batch,
                           on_epoch=prog)
+        # проверка на самом свежем куске, которого модель не видела: в каждом моменте — лучшая по прогнозу комбинация
         pv = model.predict((Xv - mu) / sd)
-        # проверка на свежих данных, как в бою: в каждый момент рынка сеть берёт лучшую по прогнозу комбинацию
-        # настроек (из тех, что прогнаны) и торгует, только если прогноз выше порога.
-        # Сравниваем с тем, что сделал бы бот без сети: обычные настройки на каждую монету из сканера.
         gv, dv = g[-n_val:], dflt[-n_val:]
         o = np.lexsort((-pv, gv))
         _, first = np.unique(gv[o], return_index=True)
         best_rows = o[first]
-        take = pv[best_rows] > self.a.nn_min_edge
-        chosen = best_rows[take]
+        chosen = best_rows[pv[best_rows] > self.a.nn_min_edge]
         sel_avg = float(yv[chosen].mean()) if len(chosen) else 0.0
         base_avg = float(yv[dv == 1].mean()) if (dv == 1).any() else 0.0
-        sel = np.zeros(len(yv), bool)
-        sel[chosen] = True
-        corr = float(np.corrcoef(pv, yv)[0, 1]) if len(yv) > 2 and np.std(pv) > 0 else 0.0
-        active = bool(len(chosen) >= 30 and sel_avg > 0 and sel_avg > base_avg)
-        mostly = []
-        if len(chosen) >= 30:
-            for k in CONFIG_KEYS:
-                vals, cnt = np.unique(Xv[chosen][:, FEATURES.index(k)], return_counts=True)
-                v = vals[np.argmax(cnt)]
-                share = cnt.max() / cnt.sum() * 100
-                lab = (("геометрическую" if v else "обычную") if k == "geo" else
-                       f"{v:g} мин" if k == "hold" else f"стоп {v:g}%" if k == "stop" else f"{FEATURE_RU[k]} {v:g}")
-                mostly.append(f"{lab} ({share:.0f}%)")
+        self.val_active = bool(len(chosen) >= 30 and sel_avg > 0 and sel_avg > base_avg)
         # важность признаков: насколько растёт ошибка, если перемешать признак на проверке
-        Zv = (Xv - mu) / sd
+        Zv, yvi = (Xv - mu) / sd, yv
         if len(Zv) > 20000:
             Zv, yvi = Zv[-20000:], yv[-20000:]
-        else:
-            yvi = yv
         base_err = float(np.mean(np.abs(model.predict(Zv) - yvi)))
         rng = np.random.default_rng(1)
         imp = []
@@ -708,52 +756,136 @@ class Brain:
             Zs[:, k] = rng.permutation(Zs[:, k])
             imp.append((FEATURES[k], float(np.mean(np.abs(model.predict(Zs) - yvi)) - base_err)))
         imp.sort(key=lambda x: -x[1])
-        run = {
-            "time": int(time.time() * 1000), "samples": int(len(y)), "real": int((kind == 1).sum()),
-            "train_loss": curve[-1]["train"], "val_loss": min(c["val"] for c in curve), "corr": corr,
-            "sel_avg": sel_avg, "base_avg": base_avg, "sel_n": int(sel.sum()), "val_n": int(len(best_rows)),
-            "sel_share": float(sel.mean()) if len(yv) else 0.0, "active": active, "epochs": len(curve),
-        }
-        prev = self.history[-1] if self.history else None
-        was_active = self.active
+        # для решений в бою — модель, дообученная и на свежем куске
+        model.fit((X - mu) / sd, y, w, X[:0], y[:0], epochs=max(1, self.a.nn_online_epochs), lr=1e-3,
+                  batch=batch, patience=0, restore_best=False)
         with self.lock:
             self.model, self.mu, self.sd = model, mu, sd
-            self.active = active
             self.curve = curve
-            self.history.append(run)
-            self.last_train_n = len(y)
             self.importance = imp
+            self.trained_until = float(t.max())
+        self.last_full = time.time()
+        self.new_since_update = 0
+        self.cnt["full"] += 1
         best_ep = min(curve, key=lambda c: c["val"])["epoch"]
-        lines = [f"Ошибка: на обучении {curve[-1]['train']:.3f}, на проверке {run['val_loss']:.3f} "
-                 f"(лучшая на проходе {best_ep} из {len(curve)})"]
-        if len(curve) < self.a.nn_epochs:
-            lines.append(f"Остановилась на проходе {len(curve)}: дальше проверка не улучшалась — это было бы заучивание шума")
-        lines.append(f"Связь прогноза с реальным итогом на проверке: {corr:+.2f} "
-                     + ("(слабая)" if abs(corr) < 0.15 else "(заметная)" if abs(corr) < 0.4 else "(сильная)"))
-        lines.append(f"На проверке из {run['val_n']:,} моментов рынка торговала бы в {run['sel_n']:,}: в среднем {sel_avg:+.3f}% "
-                     f"против {base_avg:+.3f}% у бота без меня (обычные настройки, все монеты сканера)")
-        if mostly:
-            lines.append("Чаще всего выбирала: " + ", ".join(mostly))
-        if prev:
-            d = sel_avg - prev["sel_avg"]
-            lines.append(f"По сравнению с прошлым обучением мой отбор {'лучше' if d > 0 else 'хуже'} на {abs(d):.3f}%")
-        lines.append("Больше всего опираюсь на: " + ", ".join(f"{FEATURE_RU[k]}" for k, v in imp[:4] if v > 0))
-        self.think("train", f"Обучение №{len(self.history)} готово", lines)
-        if active and not was_active:
+        lines = [f"Примеров: {len(y):,} за последние {self.a.nn_window_hours:g} ч, реальных сеток: {int((kind == 1).sum())}",
+                 f"Ошибка: на обучении {curve[-1]['train']:.3f}, на свежем куске {min(c['val'] for c in curve):.3f} "
+                 f"(лучшая на проходе {best_ep} из {len(curve)})",
+                 f"На свежем куске взяла бы {len(chosen):,} из {len(best_rows):,} моментов: в среднем {sel_avg:+.3f}% "
+                 f"против {base_avg:+.3f}% у обычных настроек",
+                 "Больше всего опираюсь на: " + ", ".join(FEATURE_RU[k] for k, v in imp[:4] if v > 0)]
+        self.think("train", "Полное переобучение готово", lines)
+
+    def online_update(self, now):
+        """Дообучение каждую минуту: несколько проходов по свежей памяти, начиная с текущих весов."""
+        X, y, w, t, _, _, _ = self._arrays(now)
+        m2 = self.model.copy()
+        m2.fit((X - self.mu) / self.sd, y, w, X[:0], y[:0], epochs=self.a.nn_online_epochs, lr=self.a.nn_online_lr,
+               batch=512, patience=0, restore_best=False, seed=self.cnt["updates"])
+        with self.lock:
+            self.model = m2
+            self.trained_until = float(t.max())
+        self.new_since_update = 0
+        self.cnt["updates"] += 1
+
+    # --- шаг учёбы (раз в минуту)
+    def step(self):
+        a = self.a
+        now = time.time() * 1000
+        first = not self.K
+        syms = self.learn_symbols()
+        if first:
+            self.think("data", f"Беру свежий рынок: последние {a.nn_window_hours:g} ч минутных свечей по {len(syms)} монетам",
+                       ["Старую историю не беру — для скальпинга важен только текущий рынок",
+                        f"Каждую минуту — новый момент рынка по каждой монете; в нём я прогоняю обычные настройки, "
+                        f"{a.nn_configs} случайные и свой выбор по свечам, которые идут после"])
+        with self.lock:
+            model = (self.model, self.mu, self.sd)
+        need = set(syms) | {r["sym"] for r in self.pending}
+        made = 0
+        for i, sym in enumerate(sorted(need, key=lambda s: s not in syms)):
+            self.progress = f"свечи: {sym} ({i + 1}/{len(need)})"
+            try:
+                self.refresh_candles(sym, now)
+                if sym in syms:
+                    made += self.make_moments(sym, now, model)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Нейросеть: %s: %s", sym, e)
+        for sym in [s for s in self.K if s not in need]:
+            del self.K[sym]
+        self.progress = "разбираю итоги"
+        resolved = self.resolve(now)
+        self.cnt["moments"] += made
+        self.cnt["resolved"] += resolved
+        self._flush()
+        self._trim(now)
+        if first and resolved:
+            self.think("data", "Свежий рынок загружен",
+                       [f"Монет: {len(self.K)}, моментов рынка: {made:,}, сеток с известным итогом: {resolved:,}",
+                        "Что сейчас лучше шло: " + "; ".join(self.setting_effects(self.X.astype(float), self.y.astype(float)))])
+        if self.n() < 300:
+            self.status_text = f"собираю данные ({self.n()} примеров)"
+        elif self.model is None or time.time() - self.last_full >= a.nn_full_every * 60:
+            self.full_train(now)
+        elif self.new_since_update >= 20:
+            self.progress = "дообучаюсь"
+            self.online_update(now)
+        self.progress = ""
+        # решение: онлайн-проверка за последний час, пока её мало — проверка при полном переобучении
+        om = self.online_metrics(now, a.nn_eval_min)
+        was = self.active
+        if om["sel_n"] >= a.nn_eval_min_n:
+            self.active, src = bool(om["sel_avg"] > 0 and om["sel_avg"] > om["base_avg"]), "online"
+        else:
+            self.active, src = self.val_active, "full"
+        if self.model is not None:
+            mae = float(np.mean(self.new_err)) if self.new_err else None
+            self.history.append({"time": int(now), "samples": self.n(), "real": int((self.kind == 1).sum()),
+                                 "sel_avg": om["sel_avg"] if om["sel_n"] else None,
+                                 "base_avg": om["base_avg"] if om["n"] else None, "sel_n": om["sel_n"],
+                                 "val_n": om["n"], "corr": om["corr"], "active": self.active, "src": src, "mae": mae})
+            self.history = self.history[-600:]
+        if self.active and not was:
             self.think("decide", "Включаюсь в принятие решений",
-                       ["Проверка пройдена: мой отбор в плюсе и лучше сканера", "Теперь выбираю монету и шаг сетки сама"])
-        elif not active and was_active:
+                       [f"За последние {a.nn_eval_min:g} мин мой выбор по факту: {om['sel_avg']:+.3f}% в {om['sel_n']} сделках "
+                        f"против {om['base_avg']:+.3f}% у обычных настроек" if src == "online" else
+                        "Онлайн-проверки пока мало — включилась по проверке на свежем куске при переобучении",
+                        "Теперь выбираю монету, все настройки сетки и маржу сама"])
+        elif was and not self.active:
             self.think("warn", "Отключаюсь от решений",
-                       ["На свежей проверке мой отбор больше не лучше сканера — бот торгует по сканеру, я продолжаю учиться"])
-        elif not active:
-            why = ("мало сеток прошли бы мой отбор" if sel.sum() < 30 else
-                   "мой отбор на проверке в минусе" if sel_avg <= 0 else "мой отбор не лучше всех сеток сканера")
-            self.think("warn", "Пока не включаюсь", [f"Причина: {why}"])
-        self.think("plan", "Что дальше", self.plan_lines())
-        self.status_text = ("ПРИНИМАЕТ РЕШЕНИЯ" if active else "учится (на проверке пока не лучше сканера)")
-        log.info("Нейросеть: обучена на %d примерах | проверка: отбор %+.3f%% vs все %+.3f%% (%d сеток) | %s",
-                 len(y), sel_avg, base_avg, run["sel_n"], "активна" if active else "не активна")
-        self.save()
+                       [f"За последние {a.nn_eval_min:g} мин мой выбор: {om['sel_avg']:+.3f}% против {om['base_avg']:+.3f}% "
+                        f"у обычных — бот торгует обычными настройками, я учусь дальше"])
+        self.status_text = "ПРИНИМАЕТ РЕШЕНИЯ" if self.active else (
+            "учится на ходу" if self.model is not None else self.status_text)
+        if time.time() - self.last_summary >= a.nn_summary_min * 60 and self.model is not None:
+            self.summary(now, om)
+        if time.time() - self.last_save >= 300:
+            self.save()
+        self.last_step = time.time()
+
+    def summary(self, now, om):
+        a = self.a
+        mins = (time.time() - self.last_summary) / 60
+        c = self.cnt
+        mae = float(np.mean(self.new_err)) if self.new_err else None
+        lines = [f"За {mins:.0f} мин: новых моментов рынка {c['moments']:,}, сеток с известным итогом {c['resolved']:,}, "
+                 f"дообучений {c['updates']}" + (f", полных переобучений {c['full']}" if c['full'] else ""),
+                 f"Учусь на {self.n():,} примерах за последние {a.nn_window_hours:g} ч"
+                 + (f"; ошибка прогноза на ещё не виденных сетках {mae:.3f}%" if mae is not None else "")]
+        if om["sel_n"]:
+            lines.append(f"Онлайн-проверка за {a.nn_eval_min:g} мин: из {om['n']:,} моментов брала бы {om['sel_n']:,} — "
+                         f"по факту {om['sel_avg']:+.3f}% против {om['base_avg']:+.3f}% у обычных настроек; "
+                         f"связь прогноза с итогом {om['corr']:+.2f}")
+        else:
+            lines.append("Онлайн-проверка ещё копится: мои первые решения ждут, пока сетки отработают")
+        with self.lock:
+            recent = self.t >= now - 30 * 60_000 - HORIZON_MIN * 60_000
+            Xr, yr = self.X[recent].astype(float), self.y[recent].astype(float)
+        if len(yr) >= 100:
+            lines.append("Сейчас лучше работает: " + "; ".join(self.setting_effects(Xr, yr)))
+        self.think("train", "Учусь на ходу", lines)
+        self.cnt.clear()
+        self.last_summary = time.time()
 
     # --- решения
     def evaluate(self, cand):
@@ -764,16 +896,20 @@ class Brain:
             return None
         dflt = default_cfg(self.a)
         fd, ld = variant(base, dflt, self.a.max_levels)
-        if not self.model:
-            return {"best": (dflt, ld, None, fd), "default": (dflt, ld, None, fd), "top": [], "size": 1.0}
-        rows = [variant(base, c, self.a.max_levels) for c in ALL_CONFIGS]
         with self.lock:
-            Z = (np.array([vec(f) for f, _ in rows] + [vec(fd)]) - self.mu) / self.sd
-            p = self.model.predict(Z)
+            mdl, mu, sd = self.model, self.mu, self.sd
+        if mdl is None:
+            return {"best": (dflt, ld, None, fd), "default": (dflt, ld, None, fd), "top": [], "size": 1.0}
+        X, levels = feature_matrix(base, self.allowed, self.a.max_levels)
+        p = mdl.predict((np.vstack([X, [vec(fd)]]) - mu) / sd)
         pd_ = float(p[-1])
         p = p[:-1]
-        order = np.argsort(-p)
-        top = [(ALL_CONFIGS[k], rows[k][1], float(p[k]), rows[k][0]) for k in order[:3]]
+        order = np.argsort(-p)[:3]
+        top = []
+        for k in order:
+            cfg = ALL_CONFIGS[int(self.allowed[k])]
+            f, lv = variant(base, cfg, self.a.max_levels)
+            top.append((cfg, lv, float(p[k]), f))
         best = top[0]
         return {"best": best, "default": (dflt, ld, pd_, fd), "top": top, "size": self.size_for(best[2])}
 
@@ -807,43 +943,39 @@ class Brain:
         self.think("decide", title, lines)
 
     def loop(self):
-        """Фон: учебные сетки раз в --nn-refresh минут, дообучение при новых данных."""
+        """Фон: шаг учёбы раз в минуту, через несколько секунд после закрытия минутной свечи."""
         while True:
             try:
-                if time.time() - self.last_boot > self.a.nn_refresh * 60:
-                    self.status_text = "собираю учебные сетки" if not self.model else self.status_text
-                    self.last_boot = time.time()      # даже если сбор упадёт, не долбим биржу каждые 20 сек
-                    added = self.bootstrap()
-                    log.info("Нейросеть: +%d учебных примеров (всего %d)", added, self.n())
-                    self.save()
-                if self.n() - self.last_train_n >= self.a.nn_retrain_every or (self.model is None and self.n() >= 300):
-                    self.train()
-                self.progress = ""
+                self.step()
             except Exception as e:  # noqa: BLE001
                 log.warning("Нейросеть: ошибка: %s", e)
                 self.progress = f"ошибка: {e}"
-            time.sleep(20)
+            nxt = (int(time.time() // 60) + 1) * 60 + 3
+            time.sleep(max(1.0, nxt - time.time()))
 
     def start(self):
-        if self.model:
-            self.think("plan", "Запускаюсь с сохранённой памятью",
-                       [f"В памяти {self.n():,} примеров, обучений было {len(self.history)}",
-                        "Сейчас: " + ("принимаю решения" if self.active else "учусь, решает сканер")] + self.plan_lines())
-        else:
-            self.think("plan", "Запускаюсь с нуля",
-                       ["Памяти нет — сначала соберу учебные сетки по свежим свечам, потом обучусь",
-                        "Пока я не прошла проверку, монеты выбирает обычный сканер"])
+        lines = ["Учусь на ходу: только последние часы рынка, дообучение каждую минуту",
+                 "Пока я не прошла проверку, бот торгует обычными настройками"]
+        if self.removed_hist:
+            lines.append("Удалила кэш месячной истории — для скальпинга он не нужен")
+        if self.model is not None:
+            lines.insert(0, "Модель из памяти загружена, свежие данные дочитаю за минуту")
+        self.think("plan", "Запускаюсь", lines + self.plan_lines())
         threading.Thread(target=self.loop, daemon=True).start()
 
     def status(self):
+        now = time.time() * 1000
+        om = self.online_metrics(now, self.a.nn_eval_min)
         with self.lock:
             return {
                 "active": self.active, "text": self.status_text, "progress": self.progress,
                 "samples": self.n(), "real": int((self.kind == 1).sum()) + sum(1 for b in self._buf if b[4] == 1),
-                "history": self.history[-200:], "curve": self.curve, "preds": self.preds[:12],
+                "history": self.history[-600:], "curve": self.curve, "preds": self.preds[:12],
                 "min_edge": self.a.nn_min_edge, "enabled": self.a.nn,
-                "horizon": int(min(HORIZON_MIN, self.a.max_minutes)),
+                "horizon": int(self.a.nn_max_hold),
                 "thoughts": list(self.thoughts)[:80], "plan": self.plan_lines(),
                 "importance": [{"name": FEATURE_RU[k], "value": v} for k, v in self.importance[:8]],
-                "hist": self.hist,
+                "online": om, "pending": len(self.pending), "coins": len(self.K),
+                "window_h": self.a.nn_window_hours, "eval_min": self.a.nn_eval_min,
+                "mae": float(np.mean(self.new_err)) if self.new_err else None,
             }

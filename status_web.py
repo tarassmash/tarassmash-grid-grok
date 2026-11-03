@@ -113,30 +113,35 @@ def render_nn(nn):
         return ""
     hist = nn["history"]
     curve = nn["curve"]
-    last = hist[-1] if hist else None
     pill = ('<span class="nnpill on">ПРИНИМАЕТ РЕШЕНИЯ</span>' if nn["active"]
             else '<span class="nnpill off">УЧИТСЯ</span>')
     if not nn["enabled"]:
         pill += ' <span class="nnpill off">решения выключены (--no-nn)</span>'
+    om = nn.get("online") or {}
+    em = nn.get("eval_min", 60)
+    cls = lambda v: "pos" if v > 0 else "neg"  # noqa: E731
     kv = f"""<div class="kv">
       <div><span>Состояние</span><b>{escape(nn['text'])}</b></div>
-      <div><span>Примеров</span><b>{nn['samples']:,}</b></div>
-      <div><span>Из них реальных сеток</span><b>{nn['real']}</b></div>
-      <div><span>Обучений</span><b>{len(hist)}</b></div>
-      {f'<div><span>Последнее: отбор сети</span><b class="{"pos" if last["sel_avg"] > 0 else "neg"}">{last["sel_avg"]:+.3f}%</b></div>' if last else ''}
-      {f'<div><span>Последнее: все сетки сканера</span><b class="{"pos" if last["base_avg"] > 0 else "neg"}">{last["base_avg"]:+.3f}%</b></div>' if last else ''}
-      {f'<div><span>Связь прогноза с итогом</span><b>{last["corr"]:+.2f}</b></div>' if last else ''}
+      <div><span>Примеров за {nn.get('window_h', 4):g} ч</span><b>{nn['samples']:,}</b></div>
+      <div><span>Реальных сеток за сутки</span><b>{nn['real']}</b></div>
+      <div><span>Монет в учёбе</span><b>{nn.get('coins', 0)}</b></div>
+      <div><span>Ждут итога</span><b>{nn.get('pending', 0):,}</b></div>
+      <div><span>Онлайн {em:g} мин: выбор сети</span><b class="{cls(om.get('sel_avg', 0))}">{om.get('sel_avg', 0):+.3f}%</b></div>
+      <div><span>Онлайн {em:g} мин: обычные</span><b class="{cls(om.get('base_avg', 0))}">{om.get('base_avg', 0):+.3f}%</b></div>
+      <div><span>Сделок сети в проверке</span><b>{om.get('sel_n', 0)} из {om.get('n', 0)}</b></div>
+      {f'<div><span>Ошибка на новых сетках</span><b>{nn["mae"]:.3f}%</b></div>' if nn.get("mae") is not None else ''}
     </div>"""
     prog = f'<p class="muted small">Сейчас: {escape(nn["progress"])}</p>' if nn["progress"] else ""
     ch1 = svg_chart([("ошибка на обучении", "var(--acc)", [c["train"] for c in curve]),
                      ("ошибка на проверке", "var(--warn)", [c["val"] for c in curve])],
                     xlabels=[f"эп. {c['epoch']}" for c in curve])
-    labels = [time.strftime("%d.%m %H:%M", time.gmtime(r["time"] / 1000)) for r in hist]
-    ch2 = svg_chart([("сетки, отобранные сетью", "var(--pos)", [r["sel_avg"] for r in hist]),
-                     ("все сетки сканера", "var(--muted)", [r["base_avg"] for r in hist])],
+    labels = [time.strftime("%H:%M", time.gmtime(r["time"] / 1000)) for r in hist]
+    ch2 = svg_chart([("выбор сети по факту", "var(--pos)", [r["sel_avg"] for r in hist]),
+                     ("обычные настройки", "var(--muted)", [r["base_avg"] for r in hist])],
                     xlabels=labels, unit="%", zero=True)
-    ch3 = svg_chart([("всего примеров", "var(--acc)", [r["samples"] for r in hist]),
-                     ("реальных сеток ×100", "var(--warn)", [r["real"] * 100 for r in hist])], xlabels=labels)
+    ch3 = svg_chart([("ошибка прогноза на ещё не виденных сетках", "var(--warn)", [r.get("mae") for r in hist])],
+                    xlabels=labels, unit="%")
+    ch4 = svg_chart([("примеров в памяти", "var(--acc)", [r["samples"] for r in hist])], xlabels=labels)
     preds = "".join(
         f"<tr><td>{escape(x['symbol'])}</td><td>{'—' if x['pred'] is None else '%+.3f%%' % x['pred']}</td>"
         f"<td>{'%+.3f%%' % x.get('pred_default', 0)}</td><td class=\"cfgcell\">{escape(x.get('cfg', ''))}</td>"
@@ -158,14 +163,16 @@ def render_nn(nn):
         for i in imp) or '<p class="muted">Появится после первого обучения</p>'
     return f"""
 <div class="panel"><h2>Нейросеть {pill}</h2>{kv}{prog}
-  <p class="muted small">Учится на учебных сетках по свежим свечам и на каждой закрытой реальной сетке (вес ×3).
-  Решения принимает, только если на проверке (последние 20% данных, которых при обучении не было) сетки, которые она отбирает,
-  в плюсе и лучше всех сеток сканера. Прогноз — доходность сетки в % от объёма позиции за {escape(str(nn.get('horizon', 60)))} мин.</p>
+  <p class="muted small">Учится на ходу: в памяти только последние {nn.get('window_h', 4):g} ч рынка. Каждую минуту — новые моменты
+  рынка, в каждом сеть сразу фиксирует свой выбор настроек; когда сетка отработает (20–{escape(str(nn.get('horizon', 90)))} мин),
+  итог идёт в обучение и в онлайн-проверку. Решения принимает, только если за последние {em:g} мин её выбор по факту в плюсе
+  и лучше обычных настроек. Реальные сетки на бирже учат её с весом ×3.</p>
 </div>
 <div class="charts">
-  <div class="panel"><h2>Последнее обучение: ошибка по эпохам</h2>{ch1}</div>
-  <div class="panel"><h2>Качество на проверке по обучениям</h2>{ch2}</div>
-  <div class="panel"><h2>Сколько данных накоплено</h2>{ch3}</div>
+  <div class="panel"><h2>Онлайн-проверка за {em:g} мин: выбор сети vs обычные</h2>{ch2}</div>
+  <div class="panel"><h2>Ошибка прогноза на новых сетках</h2>{ch3}</div>
+  <div class="panel"><h2>Полное переобучение: ошибка по эпохам</h2>{ch1}</div>
+  <div class="panel"><h2>Память нейросети</h2>{ch4}</div>
   <div class="panel"><h2>План нейросети</h2><ul class="plan">{plan}</ul>
     <h2 style="margin-top:14px">На что она опирается</h2>{imp_html}</div>
   <div class="panel" style="grid-column:1/-1"><h2>Прогнозы по текущим кандидатам</h2>
