@@ -27,7 +27,7 @@ STATUS = {
     "grid": None,
     "history": [],
 }
-LOGS = collections.deque(maxlen=200)
+LOGS = collections.deque(maxlen=400)
 LOCK = threading.Lock()
 
 # Управление со страницы. paused=True: бот закрывает текущую сетку и не открывает новые.
@@ -55,7 +55,7 @@ def snapshot():
     data["paused"] = CONTROL["paused"]
     data["control_msg"] = CONTROL["msg"]
     data["uptime_min"] = round((time.time() - STATUS["started"]) / 60, 1)
-    data["logs"] = list(LOGS)[-60:]
+    data["logs"] = list(LOGS)[-200:]
     data["nn"] = BRAIN.status() if BRAIN else None
     return data
 
@@ -268,6 +268,9 @@ td:first-child,th:first-child{{text-align:left}}th{{font:600 11px system-ui;colo
 .start{{background:var(--acc);color:#06231a}}.stop{{background:var(--neg);color:#2a0705}}
 .cstate{{font-weight:700}}.cstate.on{{color:var(--pos)}}.cstate.off{{color:var(--warn)}}
 .cmsg{{color:var(--muted);font-size:13px}}
+.topr{{display:flex;align-items:center;gap:8px}}
+.live{{font:600 12px system-ui;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:transparent;
+  color:var(--pos);cursor:pointer}}.live.off{{color:var(--warn)}}
 .charts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:14px}}
 .chart{{width:100%;height:auto;display:block}}.chart .grid{{stroke:var(--line);stroke-width:1}}
 .chart .zero{{stroke:var(--muted);stroke-width:1;stroke-dasharray:4 3}}.chart .ax{{fill:var(--muted);font:11px ui-monospace,monospace}}
@@ -288,7 +291,7 @@ td:first-child,th:first-child{{text-align:left}}th{{font:600 11px system-ui;colo
 .bar{{height:6px;background:var(--line);border-radius:3px;overflow:hidden}}.bar i{{display:block;height:100%;background:var(--acc)}}.small{{font-size:12px;margin:8px 0 0}}
 pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;color:#c9d6d0;white-space:pre-wrap}}
 </style></head><body><div class="wrap">
-<div class="top"><h1>Vol Grid Bot</h1><span class="pill">{escape(str(s['mode']))}</span></div>
+<div class="top"><h1>Vol Grid Bot</h1><div class="topr"><button type="button" class="live" id="live-btn">Обновление: вкл</button><span class="pill">{escape(str(s['mode']))}</span></div></div>
 {err}
 <div class="panel">{controls}</div>
 <div class="panel"><div class="kv">
@@ -307,13 +310,77 @@ pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mo
 <p class="muted">Страница обновляется каждые 5 сек. Прибыль — оценка бота; точные цифры в истории Bybit.</p>
 </div>
 <script>
-// автообновление каждые 5 сек; ключ управления запоминается в этом браузере
-const k = document.querySelector('input[name=key]');
-try {{ if (k) k.value = localStorage.getItem('ctrlKey') || ''; }} catch (e) {{}}
-document.querySelector('.ctrl')?.addEventListener('submit', () => {{
-  try {{ if (k) localStorage.setItem('ctrlKey', k.value); }} catch (e) {{}}
+// Обновление без перезагрузки: раз в 5 сек подменяем содержимое на месте и оставляем на экране то,
+// что сейчас читаешь (прокрутка страницы, лога и мыслей не прыгает). Пока выделен текст — не обновляем.
+let paused = false;
+const keyIn = () => document.querySelector('input[name=key]');
+try {{ const k = keyIn(); if (k) k.value = localStorage.getItem('ctrlKey') || ''; }} catch (e) {{}}
+document.addEventListener('submit', e => {{
+  const k = keyIn();
+  try {{ if (k) localStorage.setItem('ctrlKey', k.value); }} catch (er) {{}}
 }});
-setInterval(() => {{ if (document.activeElement !== k) location.reload(); }}, 5000);
+function paintBtn() {{
+  const b = document.getElementById('live-btn');
+  if (b) {{ b.textContent = paused ? 'Обновление: пауза' : 'Обновление: вкл'; b.classList.toggle('off', paused); }}
+}}
+document.addEventListener('click', e => {{
+  if (e.target && e.target.id === 'live-btn') {{ paused = !paused; paintBtn(); if (!paused) refresh(); }}
+}});
+const SCROLLS = '.thoughts, pre, .scroll';
+// что сейчас вверху видимой области: строка лога или запись мыслей (+ сдвиг внутри неё)
+function anchorOf(el) {{
+  if (el.tagName === 'PRE') {{
+    const lines = el.textContent.split('\\n'), lh = el.scrollHeight / Math.max(lines.length, 1);
+    const i = Math.floor(el.scrollTop / lh);
+    return {{ pre: true, text: lines[i], off: el.scrollTop - i * lh }};
+  }}
+  const r = el.getBoundingClientRect();
+  const k = [...el.children].find(c => c.getBoundingClientRect().bottom > r.top + 1);
+  return k ? {{ text: k.textContent.slice(0, 300), off: k.getBoundingClientRect().top - r.top }} : null;
+}}
+// новое добавляется сверху: возвращаем на экран ту же строку / ту же запись, что читал
+function restore(el, o) {{
+  el.scrollLeft = o.left;
+  if (!(o.top > 0 || o.hover) || !o.a) return;
+  if (o.a.pre) {{
+    const lines = el.textContent.split('\\n'), lh = el.scrollHeight / Math.max(lines.length, 1);
+    const i = lines.indexOf(o.a.text);
+    el.scrollTop = i >= 0 ? i * lh + o.a.off : o.top;
+    return;
+  }}
+  el.scrollTop = o.top;
+  const k = [...el.children].find(c => c.textContent.slice(0, 300) === o.a.text);
+  if (k) el.scrollTop += k.getBoundingClientRect().top - el.getBoundingClientRect().top - o.a.off;
+}}
+async function refresh() {{
+  if (paused || document.hidden) return;
+  const sel = window.getSelection && window.getSelection();
+  if (sel && sel.toString()) return;
+  const k = keyIn();
+  if (k && document.activeElement === k) return;
+  let html;
+  try {{ html = await (await fetch(location.pathname, {{ cache: 'no-store' }})).text(); }} catch (e) {{ return; }}
+  const nxt = new DOMParser().parseFromString(html, 'text/html').querySelector('.wrap');
+  const cur = document.querySelector('.wrap');
+  if (!nxt || !cur || paused) return;
+  const old = [...cur.querySelectorAll(SCROLLS)].map(el => ({{ top: el.scrollTop, left: el.scrollLeft,
+    hover: el.matches(':hover'), a: anchorOf(el) }}));
+  const pkey = p => (p.querySelector('h2, h1') || {{}}).textContent || p.className;
+  const panels = [...cur.children];
+  const ap = panels.find(p => p.getBoundingClientRect().bottom > 0);
+  const aKey = ap ? pkey(ap) : null, aTop = ap ? ap.getBoundingClientRect().top : 0, aIdx = panels.indexOf(ap);
+  const keyVal = k ? k.value : '';
+  cur.innerHTML = nxt.innerHTML;
+  const k2 = keyIn();
+  if (k2) k2.value = keyVal;
+  [...cur.querySelectorAll(SCROLLS)].forEach((el, i) => {{ if (old[i]) restore(el, old[i]); }});
+  if (ap) {{
+    const np = [...cur.children].find(p => pkey(p) === aKey) || cur.children[aIdx];
+    if (np) window.scrollBy(0, np.getBoundingClientRect().top - aTop);
+  }}
+  paintBtn();
+}}
+setInterval(refresh, 5000);
 </script></body></html>"""
 
 
