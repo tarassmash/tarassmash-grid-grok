@@ -37,7 +37,8 @@ CONFIG_SPACE = {
     "lotk": [1.0, 1.2, 1.5],          # рост лота на каждый уровень от цены
     "shift": [1, 2, 4],               # идти за ценой, когда она дальше края на N шагов
     "stop": [3, 6, 10],               # стоп по убытку, % от объёма позиции
-    "hold": [20, 40, 60, 90],         # сколько минут держать сетку
+    "hold": [10, 20, 40, 60, 90],     # сколько минут держать сетку (10 — итог узнаю быстрее всего)
+    "tp": [0, 0.3, 0.6, 1.0],         # тейк-профит сетки, % от объёма позиции (0 = нет)
 }
 CONFIG_KEYS = list(CONFIG_SPACE)
 MARKET = ["vol1m", "atr", "er", "width", "log_turnover", "ret_win", "ret_5", "pos_range", "atr_trend"]
@@ -49,7 +50,7 @@ FEATURE_RU = {
     "ret_win": "движение за 15 мин", "ret_5": "движение за 5 мин", "pos_range": "место цены в диапазоне",
     "atr_trend": "ускорение волатильности", "mult": "частота сетки", "wmult": "ширина сетки",
     "geo": "геометрическая сетка", "lotk": "рост лота от цены", "shift": "когда идти за ценой",
-    "stop": "стоп по убытку", "hold": "время сетки",
+    "stop": "стоп по убытку", "hold": "время сетки", "tp": "тейк-профит сетки",
 }
 
 
@@ -67,7 +68,7 @@ def default_cfg(a):
     """Обычные настройки из BOT_ARGS — то, что бот делает без нейросети."""
     return {"mult": 1.0, "wmult": 1.0, "geo": 0, "lotk": 1.0, "shift": float(a.shift_steps),
             "stop": round(a.max_loss / max(a.leverage, 1), 4) if a.max_loss > 0 else 100.0,
-            "hold": float(min(HORIZON_MIN, a.max_minutes))}
+            "hold": float(min(HORIZON_MIN, a.max_minutes)), "tp": 0.0}
 
 
 CFG_ARR = np.array([[c[k] for k in CONFIG_KEYS] for c in ALL_CONFIGS], float)
@@ -99,7 +100,7 @@ def grid_bounds(lower, upper, wmult):
 def cfg_short(cfg, levels=None):
     return (f"{'геом.' if cfg.get('geo') else 'обычн.'}{f' {levels} ур.' if levels else ''}, ширина ×{cfg['wmult']:g}, "
             f"лот {'равный' if cfg['lotk'] == 1 else '×%g' % cfg['lotk']}, сдвиг {cfg['shift']:g}, "
-            f"стоп {cfg['stop']:g}%, {cfg['hold']:g} мин")
+            f"стоп {cfg['stop']:g}%, тейк {('%g%%' % cfg['tp']) if cfg.get('tp') else 'нет'}, {cfg['hold']:g} мин")
 
 
 # ---------------------------------------------------------------- признаки
@@ -143,7 +144,7 @@ def vec(f):
 # ---------------------------------------------------------------- симулятор сетки по свечам
 
 def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pct, shift_steps=1.0, trace=None,
-                  geo=False, lotk=1.0, stop_pct=None, hold=None):
+                  geo=False, lotk=1.0, stop_pct=None, hold=None, tp_pct=0.0):
     """Прогон нейтральной сетки бота по минутным свечам future [(o,h,l,c), ...].
 
     Те же правила, что у бота: geo — равный шаг в %, lotk — рост лота на каждый уровень от цены,
@@ -226,6 +227,8 @@ def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pc
         last = c
         pnl = realized + (c - avg) * net
         if stop_at is not None and pnl <= stop_at:
+            break
+        if tp_pct and pnl >= tp_pct / 100:
             break
         edge = step * shift_steps
         if c > lv[-1] + edge or c < lv[0] - edge:
@@ -351,6 +354,7 @@ class Brain:
         self.pending = []               # моменты рынка, итог которых ещё не известен
         self.evals = collections.deque(maxlen=50000)   # онлайн-проверка: выбор сети vs обычные, по факту
         self.focus = []                 # монеты из последнего скана — учусь в первую очередь на них
+        self.watch = None               # монета работающей сетки — учусь и на ней
         self._liquid = ([], 0.0)
         self.model, self.mu, self.sd = None, None, None
         self.trained_until = 0.0        # самое свежее время, которое модель уже видела
@@ -513,10 +517,10 @@ class Brain:
                 if self.last_full else "Полное переобучение: как только наберу 300 примеров"),
                f"Память: только последние {a.nn_window_hours:g} ч рынка; свежие минуты важнее "
                f"(вес вдвое меньше каждые {a.nn_half_life_min:g} мин)",
-               f"Итог сетки узнаю, когда она отработает: короткой — через 20 мин, длинной — через {a.nn_max_hold} мин; "
+               f"Итог сетки узнаю, когда она отработает: короткой — через 10 мин, длинной — через {a.nn_max_hold} мин; "
                f"сейчас жду итог {len(self.pending):,} моментов"]
         if self.regime_hold:
-            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start)
+            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e)
             out.append(f"Рынок сменился в {time.strftime('%H:%M UTC', time.gmtime(self.regime_start / 1000))}: "
                        f"решает бот с обычными настройками; жду итогов своих решений в новом режиме — "
                        f"{n_post} из {a.nn_regime_min_n}")
@@ -533,7 +537,7 @@ class Brain:
         """Средний итог по каждой настройке: какое значение лучше шло (для мыслей)."""
         out = []
         names = {"mult": "частота ×", "wmult": "ширина ×", "geo": "", "lotk": "лот ×", "shift": "сдвиг через ",
-                 "stop": "стоп ", "hold": ""}
+                 "stop": "стоп ", "hold": "", "tp": "тейк "}
         for k in CONFIG_KEYS:
             col = X[:, FEATURES.index(k)]
             best = None
@@ -545,7 +549,8 @@ class Brain:
             if best:
                 v, m = best
                 label = ("геометрическая" if v else "обычная") if k == "geo" else (
-                    f"{v:g} мин" if k == "hold" else f"{v:g}%" if k == "stop" else f"{v:g}")
+                    f"{v:g} мин" if k == "hold" else f"{v:g}%" if k in ("stop", "tp") and v else
+                    "нет" if k == "tp" else f"{v:g}")
                 out.append(f"{names[k]}{label} ({m:+.3f}%)")
         return out
 
@@ -608,7 +613,8 @@ class Brain:
                 self._liquid = (self.symbols(), now)
             except Exception as e:  # noqa: BLE001
                 log.warning("Нейросеть: список монет: %s", e)
-        return list(dict.fromkeys(list(self.focus) + list(self._liquid[0])))[: self.a.nn_symbols]
+        first = ([self.watch] if self.watch else []) + list(self.focus)
+        return list(dict.fromkeys(first + list(self._liquid[0])))[: self.a.nn_symbols]
 
     def refresh_candles(self, sym, now):
         a = self.a
@@ -697,6 +703,7 @@ class Brain:
                     lo, hi = grid_bounds(rec["lower"], rec["upper"], cfg["wmult"])
                     r = simulate_grid(K[i0:i0 + h, 1:5], rec["price"], lo, hi, levels, a.fee, a.leverage, 0,
                                       cfg["shift"], geo=bool(cfg["geo"]), lotk=cfg["lotk"], stop_pct=cfg["stop"],
+                                      tp_pct=cfg.get("tp", 0),
                                       hold=h)
                     it["r"] = r
                     if mdl is not None and rec["t"] > self.trained_until:
@@ -704,13 +711,21 @@ class Brain:
                         self.new_err.append(abs(pz - r))
                     self.add(f, r, 0, rec["t"], 1.0, g=rec["gid"], d=it["flag"])
                     resolved += 1
-            if all("r" in it for it in rec["items"]):
-                c = rec["chosen"]
-                if c is not None and rec["items"][c]["r"] is not None and rec["items"][0]["r"] is not None:
-                    ch = rec["items"][c]
+            # онлайн-проверка: итог выбора сети засчитываем сразу, как только её сетка отработала
+            # (10-минутная — через 10 мин), итог обычных настроек — когда отработали они
+            c = rec["chosen"]
+            if c is not None and not rec.get("nlog") and "r" in rec["items"][c]:
+                rec["nlog"] = True
+                if rec["items"][c]["r"] is not None:
                     self.evals.append({"t": rec["t"], "tr": now, "sym": rec["sym"], "took": rec["took"],
-                                       "net": ch["r"], "dflt": rec["items"][0]["r"], "pred": rec["pred"]})
+                                       "net": rec["items"][c]["r"], "pred": rec["pred"]})
                     self.cnt["evals"] += 1
+            if not rec.get("dlog") and "r" in rec["items"][0]:
+                rec["dlog"] = True
+                if rec["items"][0]["r"] is not None:
+                    self.evals.append({"t": rec["t"], "tr": now, "dflt": rec["items"][0]["r"]})
+            if all("r" in it for it in rec["items"]):
+                pass
             elif now - rec["t"] <= (HORIZON_MIN + 30) * 60_000:
                 keep.append(rec)
         self.pending = keep
@@ -719,11 +734,13 @@ class Brain:
     def online_metrics(self, now, minutes, since=None):
         """Онлайн-проверка: что дал выбор сети по факту против обычных настроек за последние `minutes` мин.
         since — учитывать только решения, принятые после смены рынка."""
-        E = [e for e in self.evals if e["tr"] >= now - minutes * 60_000 and (since is None or e["t"] >= since)]
+        W = [e for e in self.evals if e["tr"] >= now - minutes * 60_000 and (since is None or e["t"] >= since)]
+        E = [e for e in W if "net" in e]            # итоги выбора сети
+        D = [e for e in W if "dflt" in e]           # итоги обычных настроек
         taken = [e for e in E if e["took"]]
-        out = {"n": len(E), "sel_n": len(taken),
+        out = {"n": len(E), "n_dflt": len(D), "sel_n": len(taken),
                "sel_avg": float(np.mean([e["net"] for e in taken])) if taken else 0.0,
-               "base_avg": float(np.mean([e["dflt"] for e in E])) if E else 0.0,
+               "base_avg": float(np.mean([e["dflt"] for e in D])) if D else 0.0,
                "policy": float(np.mean([e["net"] if e["took"] else 0.0 for e in E])) if E else 0.0, "corr": 0.0}
         if len(E) > 5:
             pr = np.array([e["pred"] for e in E])
@@ -764,7 +781,7 @@ class Brain:
         r = self.market_regime(syms)
         self.regime = r
         if self.regime_hold:
-            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start)
+            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e)
             if n_post >= a.nn_regime_min_n or now - self.regime_start >= a.nn_regime_max * 60_000:
                 self.regime_hold = False
                 self.regime_quiet = now + 10 * 60_000
@@ -796,7 +813,7 @@ class Brain:
                         "Мои знания о прошлом режиме могут не работать: пока решает бот с обычными настройками",
                         f"Учу новый режим с весом ×{a.nn_regime_boost:g}; полностью переобучусь, когда наберу 300 его примеров",
                         f"Вернусь, когда наберу минимум {a.nn_regime_min_n} итогов своих решений в новом режиме "
-                        f"(не раньше чем через 20 мин, не позже чем через {a.nn_regime_max:g} мин)"])
+                        f"(не позже чем через {a.nn_regime_max:g} мин); первый час учусь вдвое быстрее"])
 
     # --- обучение
     def _arrays(self, now):
@@ -871,7 +888,9 @@ class Brain:
         """Дообучение каждую минуту: несколько проходов по свежей памяти, начиная с текущих весов."""
         X, y, w, t, _, _, _ = self._arrays(now)
         m2 = self.model.copy()
-        m2.fit((X - self.mu) / self.sd, y, w, X[:0], y[:0], epochs=self.a.nn_online_epochs, lr=self.a.nn_online_lr,
+        fresh = self.regime_start and now - self.regime_start < 3_600_000     # первый час нового режима — учусь вдвое быстрее
+        m2.fit((X - self.mu) / self.sd, y, w, X[:0], y[:0], epochs=self.a.nn_online_epochs * (2 if fresh else 1),
+               lr=self.a.nn_online_lr * (2 if fresh else 1),
                batch=512, patience=0, restore_best=False, seed=self.cnt["updates"])
         with self.lock:
             self.model = m2
@@ -933,7 +952,7 @@ class Brain:
         was = self.active
         if self.regime_hold:
             self.active, src = False, "regime"
-        elif om["sel_n"] >= a.nn_eval_min_n:
+        elif om["sel_n"] >= a.nn_eval_min_n and om["n_dflt"] >= a.nn_eval_min_n:
             self.active, src = bool(om["sel_avg"] > 0 and om["sel_avg"] > om["base_avg"]), "online"
         else:
             self.active, src = self.val_active, "full"
@@ -941,7 +960,7 @@ class Brain:
             mae = float(np.mean(self.new_err)) if self.new_err else None
             self.history.append({"time": int(now), "samples": self.n(), "real": int((self.kind == 1).sum()),
                                  "sel_avg": om["sel_avg"] if om["sel_n"] else None,
-                                 "base_avg": om["base_avg"] if om["n"] else None, "sel_n": om["sel_n"],
+                                 "base_avg": om["base_avg"] if om["n_dflt"] else None, "sel_n": om["sel_n"],
                                  "val_n": om["n"], "corr": om["corr"], "active": self.active, "src": src, "mae": mae,
                                  "vol_ratio": self.regime["vol_ratio"] if self.regime else None})
             self.history = self.history[-600:]
@@ -1014,6 +1033,26 @@ class Brain:
         best = top[0]
         return {"best": best, "default": (dflt, ld, pd_, fd), "top": top, "size": self.size_for(best[2])}
 
+    def reassess(self, kl, cfg):
+        """Переоценка работающей сетки: сколько дала бы сетка, начатая прямо сейчас, —
+        с её текущими настройками и с лучшими. Это и есть прогноз на остаток пути."""
+        with self.lock:
+            mdl, mu, sd = self.model, self.mu, self.sd
+        if mdl is None:
+            return None
+        m = self.analyze(kl, self.a)
+        if not m:
+            return None
+        base = base_features(kl, m)
+        cur = {**default_cfg(self.a), **(cfg or {})}
+        fc, _ = variant(base, cur, self.a.max_levels)
+        X, _ = feature_matrix(base, self.allowed, self.a.max_levels)
+        p = mdl.predict((np.vstack([X, [vec(fc)]]) - mu) / sd)
+        k = int(np.argmax(p[:-1]))
+        best_cfg = ALL_CONFIGS[int(self.allowed[k])]
+        fb, _ = variant(base, best_cfg, self.a.max_levels)
+        return {"best": float(p[k]), "current": float(p[-1]), "best_cfg": cfg_short(best_cfg), "why": self.explain(fb)}
+
     def size_for(self, pred):
         """Маржа на сетку: больше при сильном прогнозе, меньше при слабом, в пределах --nn-size-min…max."""
         if pred is None or pred <= 0:
@@ -1070,7 +1109,7 @@ class Brain:
         since = (self.regime_start if self.regime_start and now - self.regime_start < self.a.nn_eval_min * 60_000
                  else None)
         om = self.online_metrics(now, self.a.nn_eval_min, since=since)
-        n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start) if self.regime_hold else 0
+        n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e) if self.regime_hold else 0
         with self.lock:
             return {
                 "regime": self.regime, "regime_hold": self.regime_hold, "regime_start": self.regime_start,

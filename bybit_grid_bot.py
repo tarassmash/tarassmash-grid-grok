@@ -172,8 +172,11 @@ def scan(s, inst, a):
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res = [r for r in ex.map(one, syms) if r]
-    res = [r for r in res if r["er"] <= a.max_er and r["turnover"] >= a.min_vol_win
-           and r["vol1m"] >= a.min_1m]
+    # когда нейросеть решает, сканер пропускает больше монет — выбирает и отсеивает уже она
+    relax = bool(BRAIN and a.nn and BRAIN.active)
+    max_er = a.nn_scan_max_er if relax else a.max_er
+    min_1m = a.min_1m * a.nn_scan_relax if relax else a.min_1m
+    res = [r for r in res if r["er"] <= max_er and r["turnover"] >= a.min_vol_win and r["vol1m"] >= min_1m]
     res.sort(key=lambda r: r["score"], reverse=True)
     res = apply_brain(res, a)
     log.info("Скан: %d пар по объёму, %d прошли фильтры", len(syms), len(res))
@@ -297,11 +300,41 @@ def chase_flat(s, sym, ins, a, timeout):
     return position(s, sym)[1] <= 0
 
 
+def brain_watch(s, a, grid):
+    """Раз в минуту нейросеть переоценивает работающую сетку по текущему рынку.
+    Если она решает и N минут подряд ждёт дальше минус — сетка закрывается досрочно (лимитками с догоном)."""
+    BRAIN.watch = grid.sym                        # учится и на этой монете
+    try:
+        kl = klines(s, grid.sym, a.window + 1)
+        r = BRAIN.reassess(kl, grid.cfg)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Нейросеть: переоценка %s: %s", grid.sym, e)
+        return None
+    if not r:
+        return None
+    grid.nn_live = r
+    if not (a.nn and BRAIN.active):
+        grid.nn_bad = 0
+        return None
+    grid.nn_bad = grid.nn_bad + 1 if r["best"] < -a.nn_exit_edge else 0
+    age = (time.time() - grid.t0) / 60
+    if grid.nn_bad >= a.nn_exit_confirm and age >= a.nn_exit_min_age:
+        BRAIN.think("decide", f"{grid.sym}: закрываю сетку досрочно",
+                    [f"{a.nn_exit_confirm} мин подряд жду дальше минус: даже лучшие настройки дают {r['best']:+.3f}% объёма, "
+                     f"текущие — {r['current']:+.3f}%",
+                     f"Сетка живёт {age:.0f} мин, сейчас PnL≈{grid.pnl():+.2f}$ — выхожу, пока не стало хуже",
+                     "Почему: " + "; ".join(f"{nn.FEATURE_RU[k]} = {v:.3g} {'тянет вверх' if d > 0 else 'тянет вниз'} {d:+.3f}%"
+                                           for k, d, v in r["why"])])
+        return f"нейросеть: дальше жду минус ({r['best']:+.3f}%)"
+    return None
+
+
 def cfg_text(cfg, levels, budget, a):
     """Настройки сетки от нейросети — коротко, для лога и страницы."""
     return (f"{'геометрическая' if cfg.get('geo') else 'обычная'}, {levels} ур., ширина ×{cfg.get('wmult', 1):g}, "
             f"лот {'равный' if cfg.get('lotk', 1) == 1 else '×%g от цены' % cfg['lotk']}, "
             f"сдвиг через {cfg.get('shift', a.shift_steps):g} шаг., стоп {cfg.get('stop', a.max_loss / a.leverage):g}% объёма, "
+            f"тейк {('%g%% объёма' % cfg['tp']) if cfg.get('tp') else 'нет'}, "
             f"держу {cfg.get('hold', a.max_minutes):g} мин, маржа {budget:.2f}$")
 
 
@@ -327,6 +360,9 @@ class Grid:
             self.stop_usdt = self.budget * self.lev * float(cfg["stop"]) / 100
         else:
             self.stop_usdt = self.budget * a.max_loss / 100 if a.max_loss > 0 else None
+        # тейк-профит сетки от нейросети (% от объёма); иначе — --tp-usdt
+        self.tp_usdt = (self.budget * self.lev * float(cfg["tp"]) / 100 if cfg.get("tp")
+                        else (a.tp_usdt if a.tp_usdt > 0 else None))
         lo, hi = float(cand["lower"]), float(cand["upper"])
         wm = float(cfg.get("wmult", 1.0))
         if wm != 1.0:
@@ -359,6 +395,9 @@ class Grid:
         self.closing = ""
         self.nn = cand.get("nn")
         self.notional = float(self.total) * float(price)
+        self.nn_checked = time.time()
+        self.nn_bad = 0                 # сколько минут подряд сеть ждёт минус дальше
+        self.nn_live = None             # последняя переоценка сетки нейросетью
 
     # --- уровни
     def set_levels(self, lo, hi):
@@ -456,7 +495,9 @@ class Grid:
             "step_pct": self.step_price / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
             "open_orders": len(self.live), "fills": self.fills, "profit": self.pnl(),
             "net": (f"L {self.long:g} / S {self.short:g}" if self.hedge else self.net), "shifts": self.shifts, "started": self.t0, "closing": self.closing,
-            "budget": self.budget, "cfg": cfg_text(self.cfg, self.n, self.budget, self.a) if self.cfg else ""})
+            "budget": self.budget, "cfg": cfg_text(self.cfg, self.n, self.budget, self.a) if self.cfg else "",
+            "nn_live": ({"best": self.nn_live["best"], "current": self.nn_live["current"], "bad": self.nn_bad}
+                        if self.nn_live else None)})
 
     # --- ордера
     def order_qty(self, i):
@@ -497,7 +538,9 @@ class Grid:
     def refill(self):
         """Поставить всё, чего не хватает в сетке (после исполнения, сдвига, снятия)."""
         placed = {v[0] for v in self.live.values()}
-        for i, (side, idx) in sorted(self.want.items()):
+        # ближние к цене уровни — первыми: если упёрлись в лимит позиции, ждут дальние, а не ближние
+        order = sorted(self.want.items(), key=lambda kv: abs(float(self.levels[kv[0]]) - self.price))
+        for i, (side, idx) in order:
             if i not in placed and self.can_place(side, idx, self.order_qty(i)):
                 self.place(i, side, idx)
 
@@ -603,7 +646,7 @@ class Grid:
         if (time.time() - self.t0) / 60 >= self.hold:
             return "истекло время"
         pnl = self.pnl()
-        if self.a.tp_usdt > 0 and pnl >= self.a.tp_usdt:
+        if self.tp_usdt and pnl >= self.tp_usdt:
             return f"тейк-профит {pnl:.2f}$"
         if self.stop_usdt and pnl <= -self.stop_usdt:
             return f"стоп по убытку {pnl:.2f}$"
@@ -752,6 +795,13 @@ def main():
     p.add_argument("--nn-eval-min", type=float, default=60, help="онлайн-проверка за последние N минут")
     p.add_argument("--nn-eval-min-n", type=int, default=20, help="минимум сделок в онлайн-проверке для решения")
     p.add_argument("--nn-max-hold", type=int, default=90, help="самая долгая сетка, которую может выбрать сеть, мин")
+    p.add_argument("--nn-scan-relax", type=float, default=0.5,
+                   help="когда сеть решает: мин. размах за минуту = --min-1m × X (сеть сама отсеет лишнее)")
+    p.add_argument("--nn-scan-max-er", type=float, default=0.9, help="когда сеть решает: макс. трендовость для скана")
+    p.add_argument("--nn-exit-edge", type=float, default=0.05,
+                   help="сеть закрывает работающую сетку, если дальше ждёт минус больше X %% объёма")
+    p.add_argument("--nn-exit-confirm", type=int, default=3, help="…столько минут подряд")
+    p.add_argument("--nn-exit-min-age", type=float, default=5, help="…и сетка живёт не меньше N минут")
     p.add_argument("--nn-regime-vol", type=float, default=1.7,
                    help="смена рынка: волатильность за 15 мин к прошлому часу больше ×X (или меньше 1/X)")
     p.add_argument("--nn-regime-er", type=float, default=0.3, help="смена рынка: трендовость за 30 мин изменилась на X")
@@ -884,6 +934,9 @@ def main():
                         price = grid.last_price()
                         grid.follow(price)
                         reason = grid.check_exit(price)
+                        if not reason and BRAIN and time.time() - grid.nn_checked >= 60:
+                            grid.nn_checked = time.time()
+                            reason = brain_watch(s, a, grid)
                         if time.time() - last_bal > 60:
                             last_bal = time.time()
                             balance(s)

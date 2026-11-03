@@ -136,7 +136,7 @@ def render_nn(nn):
       <div><span>Монет в учёбе</span><b>{nn.get('coins', 0)}</b></div>
       <div><span>Ждут итога</span><b>{nn.get('pending', 0):,}</b></div>
       <div><span>Онлайн {em:g} мин: выбор сети</span>{pct(om.get('sel_avg', 0), om.get('sel_n', 0))}</div>
-      <div><span>Онлайн {em:g} мин: обычные</span>{pct(om.get('base_avg', 0), om.get('n', 0))}</div>
+      <div><span>Онлайн {em:g} мин: обычные</span>{pct(om.get('base_avg', 0), om.get('n_dflt', om.get('n', 0)))}</div>
       <div><span>Сделок сети в проверке</span><b>{om.get('sel_n', 0)} из {om.get('n', 0)}</b></div>
       {f'<div><span>Ошибка на новых сетках</span><b>{nn["mae"]:.3f}%</b></div>' if nn.get("mae") is not None else ''}
       <div><span>Режим рынка</span><b class="{'neg' if nn.get('regime_hold') else ''}">{regime_txt}</b></div>
@@ -226,6 +226,11 @@ def render():
         </div>"""
         if g.get("cfg"):
             grid_html += f'<p class="muted small">Настройки от нейросети: {escape(g["cfg"])}</p>'
+        lv = g.get("nn_live")
+        if lv:
+            grid_html += (f'<p class="muted small">Нейросеть ведёт сетку: дальше жду {lv["current"]:+.3f}% объёма с текущими '
+                          f'настройками, {lv["best"]:+.3f}% с лучшими'
+                          + (f' — минус {lv["bad"]} мин подряд, закрою досрочно на 3-й' if lv["bad"] else '') + '</p>')
     else:
         grid_html = '<p class="muted">Сейчас сетки нет — бот ищет монету.</p>'
 
