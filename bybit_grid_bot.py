@@ -897,7 +897,7 @@ def main():
                    help="маржа на одну сетку, %% от баланса USDT (0 = брать --budget в $)")
     p.add_argument("--max-loss-pct-bal", type=float, default=2.5,
                    help="потолок убытка на одну сетку, %% от баланса (0 = брать --max-loss-usdt в $)")
-    p.add_argument("--day-loss-pct-bal", type=float, default=8,
+    p.add_argument("--day-loss-pct-bal", type=float, default=5,
                    help="дневной лимит убытка, %% от баланса на начало суток UTC (0 = брать --day-loss-usdt в $)")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
