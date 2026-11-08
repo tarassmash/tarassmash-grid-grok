@@ -857,9 +857,9 @@ def main():
                    help="не открывать сетку, если за окно сканера цена уже ушла больше чем на ±X %% (0 = выкл)")
     p.add_argument("--trend-shifts", type=int, default=3,
                    help="закрыть сетку, когда ей нужен N+1-й сдвиг подряд в одну сторону (памп/тренд); 0 = выкл")
-    p.add_argument("--max-loss-usdt", type=float, default=0,
+    p.add_argument("--max-loss-usdt", type=float, default=4,
                    help="жёсткий потолок убытка на одну сетку, $ (поверх --max-loss и стопа сети; 0 = выкл)")
-    p.add_argument("--day-loss-usdt", type=float, default=0,
+    p.add_argument("--day-loss-usdt", type=float, default=15,
                    help="за сутки UTC закрытые сетки дали минус ≥ X$ — новых сеток до завтра не открываю (0 = выкл)")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
