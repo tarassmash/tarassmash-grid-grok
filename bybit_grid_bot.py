@@ -51,7 +51,7 @@ import nn
 import status_web as web
 
 BRAIN = None   # встроенная нейросеть (nn.Brain), создаётся в main()
-DAY = {"day": "", "pnl": 0.0, "path": ""}   # итог закрытых сеток за текущие сутки UTC (для --day-loss-usdt)
+DAY = {"day": "", "pnl": 0.0, "bal": 0.0, "path": ""}   # итог закрытых сеток за текущие сутки UTC (для --day-loss-usdt)
 
 log = logging.getLogger("grid")
 CAT = "linear"
@@ -732,7 +732,7 @@ def day_load(path):
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        DAY["day"], DAY["pnl"] = d.get("day", ""), float(d.get("pnl", 0))
+        DAY["day"], DAY["pnl"], DAY["bal"] = d.get("day", ""), float(d.get("pnl", 0)), float(d.get("bal", 0))
     except Exception:  # noqa: BLE001
         pass
 
@@ -740,18 +740,49 @@ def day_load(path):
 def day_roll():
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if DAY["day"] != today:
-        DAY["day"], DAY["pnl"] = today, 0.0
+        DAY["day"], DAY["pnl"], DAY["bal"] = today, 0.0, 0.0
+
+
+def day_save():
+    if DAY["path"]:
+        try:
+            with open(DAY["path"], "w", encoding="utf-8") as f:
+                json.dump({"day": DAY["day"], "pnl": DAY["pnl"], "bal": DAY["bal"]}, f)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не сохранил дневной итог: %s", e)
 
 
 def day_add(pnl):
     day_roll()
     DAY["pnl"] += float(pnl)
-    if DAY["path"]:
-        try:
-            with open(DAY["path"], "w", encoding="utf-8") as f:
-                json.dump({"day": DAY["day"], "pnl": DAY["pnl"]}, f)
-        except Exception as e:  # noqa: BLE001
-            log.warning("Не сохранил дневной итог: %s", e)
+    day_save()
+
+
+def sizing_from_balance(s, a):
+    """Маржа на сетку, стоп и дневной лимит — в %% от баланса (если заданы --*-pct). Пересчёт перед каждым сканом:
+    пополнил счёт — бот сам берёт больше, после минусов — меньше. Дневной лимит считается от баланса на начало суток UTC."""
+    if not (a.budget_pct > 0 or a.max_loss_pct_bal > 0 or a.day_loss_pct_bal > 0) or a.dry:
+        return
+    try:
+        bal = balance(s)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Баланс не получил (%s), оставляю прошлые размеры", str(e)[:100])
+        return
+    if bal <= 0:
+        return
+    day_roll()
+    if DAY["bal"] <= 0:
+        DAY["bal"] = bal
+        day_save()
+    if a.budget_pct > 0:
+        a.budget = round(bal * a.budget_pct / 100, 2)
+    if a.max_loss_pct_bal > 0:
+        a.max_loss_usdt = round(bal * a.max_loss_pct_bal / 100, 2)
+    if a.day_loss_pct_bal > 0:
+        a.day_loss_usdt = round(DAY["bal"] * a.day_loss_pct_bal / 100, 2)
+    log.info("Размеры от баланса %.2f$: маржа на сетку %.2f$, стоп %.2f$, дневной лимит %.2f$ (за сутки %+.2f$)",
+             bal, a.budget, a.max_loss_usdt, a.day_loss_usdt, DAY["pnl"])
+    web.update(budget=a.budget)
 
 
 def day_blocked(a):
@@ -861,6 +892,13 @@ def main():
                    help="жёсткий потолок убытка на одну сетку, $ (поверх --max-loss и стопа сети; 0 = выкл)")
     p.add_argument("--day-loss-usdt", type=float, default=15,
                    help="за сутки UTC закрытые сетки дали минус ≥ X$ — новых сеток до завтра не открываю (0 = выкл)")
+    # размеры в %% от баланса (если > 0 — главнее долларовых --budget / --max-loss-usdt / --day-loss-usdt)
+    p.add_argument("--budget-pct", type=float, default=14,
+                   help="маржа на одну сетку, %% от баланса USDT (0 = брать --budget в $)")
+    p.add_argument("--max-loss-pct-bal", type=float, default=2.5,
+                   help="потолок убытка на одну сетку, %% от баланса (0 = брать --max-loss-usdt в $)")
+    p.add_argument("--day-loss-pct-bal", type=float, default=8,
+                   help="дневной лимит убытка, %% от баланса на начало суток UTC (0 = брать --day-loss-usdt в $)")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
     # нейросеть
@@ -959,6 +997,7 @@ def main():
                     web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиция закрыта"
                 time.sleep(1)
                 continue
+            sizing_from_balance(s, a)
             if day_blocked(a):
                 web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
                 pause_wait(60)
