@@ -144,12 +144,13 @@ def vec(f):
 # ---------------------------------------------------------------- симулятор сетки по свечам
 
 def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pct, shift_steps=1.0, trace=None,
-                  geo=False, lotk=1.0, stop_pct=None, hold=None, tp_pct=0.0):
+                  geo=False, lotk=1.0, stop_pct=None, hold=None, tp_pct=0.0, trend_shifts=0):
     """Прогон нейтральной сетки бота по минутным свечам future [(o,h,l,c), ...].
 
     Те же правила, что у бота: geo — равный шаг в %, lotk — рост лота на каждый уровень от цены,
     встречный ордер ставится тем же объёмом, что исполнился; сдвиг за ценой через shift_steps шагов;
-    стоп stop_pct % от объёма (или max_loss_pct % маржи); держим hold минут.
+    стоп stop_pct % от объёма (или max_loss_pct % маржи); держим hold минут;
+    trend_shifts > 0 — закрываем, когда сетке нужен (trend_shifts+1)-й сдвиг подряд в ту же сторону (памп/тренд).
     Внутри свечи цена идёт open→low→high→close (если свеча зелёная) или open→high→low→close.
     Возвращает доходность в % от объёма позиции (маржа × плечо).
     """
@@ -172,6 +173,7 @@ def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pc
 
     lv, want, step = build(lower, upper, price)
     net = avg = realized = 0.0
+    run_dir, run = 0, 0
     if stop_pct is not None:
         stop_at = -stop_pct / 100
     else:
@@ -232,6 +234,11 @@ def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pc
             break
         edge = step * shift_steps
         if c > lv[-1] + edge or c < lv[0] - edge:
+            d = 1 if c > lv[-1] else -1
+            run = run + 1 if d == run_dir else 1
+            run_dir = d
+            if trend_shifts and run > trend_shifts:
+                break                       # памп/тренд: выходим, а не идём за ценой дальше
             lv, want, step = build(c - width / 2, c + width / 2, c)
     pnl = realized + (last - avg) * net - fee_pct / 100 * abs(net) * last   # закрытие лимитками
     return pnl * 100
@@ -708,7 +715,7 @@ class Brain:
                     lo, hi = grid_bounds(rec["lower"], rec["upper"], cfg["wmult"])
                     r = simulate_grid(K[i0:i0 + h, 1:5], rec["price"], lo, hi, levels, a.fee, a.leverage, 0,
                                       cfg["shift"], geo=bool(cfg["geo"]), lotk=cfg["lotk"], stop_pct=cfg["stop"],
-                                      tp_pct=cfg.get("tp", 0),
+                                      tp_pct=cfg.get("tp", 0), trend_shifts=getattr(a, "trend_shifts", 0),
                                       hold=h)
                     it["r"] = r
                     if mdl is not None and rec["t"] > self.trained_until:

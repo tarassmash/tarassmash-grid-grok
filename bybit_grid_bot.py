@@ -35,6 +35,7 @@ Ctrl+C / остановка сервиса: бот снимет ордера и 
 """
 
 import argparse
+import json
 import logging
 import os
 import shlex
@@ -50,6 +51,7 @@ import nn
 import status_web as web
 
 BRAIN = None   # встроенная нейросеть (nn.Brain), создаётся в main()
+DAY = {"day": "", "pnl": 0.0, "path": ""}   # итог закрытых сеток за текущие сутки UTC (для --day-loss-usdt)
 
 log = logging.getLogger("grid")
 CAT = "linear"
@@ -144,6 +146,7 @@ def analyze(kl, a):
     grids = max(2, min(a.max_levels, int(width / step_pct)))
     return {
         "price": price, "vol1m": vol1m, "atr": atr, "er": er, "turnover": sum(tv),
+        "move": (c[-1] / c[0] - 1) * 100,
         "score": vol1m * (1 - er), "lower": lower, "upper": upper, "grids": grids,
         "step_pct": width / grids,
     }
@@ -158,6 +161,13 @@ def scan(s, inst, a):
     tick = api(s.get_tickers, category=CAT)["result"]["list"]
     syms = [t["symbol"] for t in tick
             if t["symbol"] in inst and float(t.get("turnover24h") or 0) >= a.min_vol]
+    # анти-памп: монета, которая за сутки уже улетела/упала больше --max-24h %, не торгуется совсем
+    chg24 = {t["symbol"]: float(t.get("price24hPcnt") or 0) * 100 for t in tick}
+    pumped = [x for x in syms if a.max_24h > 0 and abs(chg24.get(x, 0)) > a.max_24h]
+    if pumped:
+        log.info("Анти-памп: пропускаю (за 24ч > ±%g%%): %s", a.max_24h,
+                 ", ".join(f"{x} {chg24[x]:+.0f}%" for x in pumped[:8]))
+        syms = [x for x in syms if x not in pumped]
 
     def one(sym):
         try:
@@ -177,6 +187,13 @@ def scan(s, inst, a):
     max_er = a.nn_scan_max_er if relax else a.max_er
     min_1m = a.min_1m * a.nn_scan_relax if relax else a.min_1m
     res = [r for r in res if r["er"] <= max_er and r["turnover"] >= a.min_vol_win and r["vol1m"] >= min_1m]
+    # анти-памп: монета уже идёт рывком за окно — не встаём против движения (действует и когда решает сеть)
+    if a.max_move > 0:
+        moving = [r for r in res if abs(r["move"]) > a.max_move]
+        if moving:
+            log.info("Анти-памп: пропускаю (за %d мин > ±%g%%): %s", a.window, a.max_move,
+                     ", ".join(f"{r['symbol']} {r['move']:+.1f}%" for r in moving[:8]))
+        res = [r for r in res if abs(r["move"]) <= a.max_move]
     res.sort(key=lambda r: r["score"], reverse=True)
     res = apply_brain(res, a)
     log.info("Скан: %d пар по объёму, %d прошли фильтры", len(syms), len(res))
@@ -253,7 +270,7 @@ def is_hedge(s, sym):
     return any(int(p.get("positionIdx") or 0) in (1, 2) for p in r["result"]["list"])
 
 
-def chase_flat(s, sym, ins, a, timeout):
+def chase_flat(s, sym, ins, a, timeout, urgent=False):
     """Закрыть позицию ТОЛЬКО лимитками с догоном (без маркета).
 
     Сначала мейкер-лимитка у лучшей цены (PostOnly), через --chase-sec снимаем и
@@ -262,7 +279,7 @@ def chase_flat(s, sym, ins, a, timeout):
     """
     tick = ins["tick"]
     t_end = time.time() + timeout
-    tries = 0
+    tries = a.chase_tries if urgent else 0     # стоп/памп: сразу быстрая лимитка через спред, без ожидания мейкером
     while time.time() < t_end:
         side, size, idx = position(s, sym)
         if size <= 0:
@@ -360,6 +377,8 @@ class Grid:
             self.stop_usdt = self.budget * self.lev * float(cfg["stop"]) / 100
         else:
             self.stop_usdt = self.budget * a.max_loss / 100 if a.max_loss > 0 else None
+        if a.max_loss_usdt > 0:                            # жёсткий потолок убытка на сетку в $
+            self.stop_usdt = min(self.stop_usdt, a.max_loss_usdt) if self.stop_usdt else a.max_loss_usdt
         # тейк-профит сетки от нейросети (% от объёма); иначе — --tp-usdt
         self.tp_usdt = (self.budget * self.lev * float(cfg["tp"]) / 100 if cfg.get("tp")
                         else (a.tp_usdt if a.tp_usdt > 0 else None))
@@ -393,6 +412,9 @@ class Grid:
         self.price = float(price)
         self.er_checked = 0.0
         self.closing = ""
+        self.urgent = False             # закрывать сразу через спред (стоп, памп)
+        self.trend_dir, self.trend_run = 0, 0   # сдвиги подряд в одну сторону
+        self.trend_exit = ""
         self.nn = cand.get("nn")
         self.notional = float(self.total) * float(price)
         self.nn_checked = time.time()
@@ -613,6 +635,14 @@ class Grid:
             self.out_since = time.time()
         if time.time() - self.out_since < self.a.shift_sec:
             return
+        d = 1 if price > self.upper else -1
+        self.trend_run = self.trend_run + 1 if d == self.trend_dir else 1
+        self.trend_dir = d
+        if self.a.trend_shifts > 0 and self.trend_run > self.a.trend_shifts:
+            # цена уходит рывками в одну сторону: не догоняем её дальше (позиция уже против движения), выходим
+            self.trend_exit = (f"памп/тренд: {self.a.trend_shifts} сдвига подряд "
+                               f"{'вверх' if d > 0 else 'вниз'}, цена ушла снова")
+            return
         half = (self.upper - self.lower) / 2
         self.cancel_grid()
         self.set_levels(price - half, price + half)
@@ -643,12 +673,16 @@ class Grid:
         self.publish()
 
     def check_exit(self, price):
+        if self.trend_exit:
+            self.urgent = True
+            return self.trend_exit
         if (time.time() - self.t0) / 60 >= self.hold:
             return "истекло время"
         pnl = self.pnl()
         if self.tp_usdt and pnl >= self.tp_usdt:
             return f"тейк-профит {pnl:.2f}$"
         if self.stop_usdt and pnl <= -self.stop_usdt:
+            self.urgent = True
             return f"стоп по убытку {pnl:.2f}$"
         if self.a.exit_er > 0 and time.time() - self.er_checked > 30:
             self.er_checked = time.time()
@@ -666,11 +700,12 @@ class Grid:
         if self.a.dry:
             return True
         self.cancel_grid()
-        ok = chase_flat(self.s, self.sym, self.ins, self.a, timeout or self.a.close_timeout)
+        ok = chase_flat(self.s, self.sym, self.ins, self.a, timeout or self.a.close_timeout, urgent=self.urgent)
         if not ok:
             log.error("%s: позиция ещё не закрыта, продолжаю догон лимитками", self.sym)
             return False
         log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
+        day_add(self.pnl())
         if BRAIN and self.nn and self.notional > 0:
             pnl = self.pnl() - self.a.fee / 100 * abs(self.net) * self.price
             BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100, self.nn.get("pred"), self.sym)
@@ -688,6 +723,41 @@ class Grid:
             return True
         o = api(self.s.get_open_orders, category=CAT, symbol=self.sym, limit=1)
         return bool(o["result"]["list"])
+
+
+# ---------------------------------------------------------------- дневной лимит убытка
+
+def day_load(path):
+    DAY["path"] = path
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        DAY["day"], DAY["pnl"] = d.get("day", ""), float(d.get("pnl", 0))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def day_roll():
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if DAY["day"] != today:
+        DAY["day"], DAY["pnl"] = today, 0.0
+
+
+def day_add(pnl):
+    day_roll()
+    DAY["pnl"] += float(pnl)
+    if DAY["path"]:
+        try:
+            with open(DAY["path"], "w", encoding="utf-8") as f:
+                json.dump({"day": DAY["day"], "pnl": DAY["pnl"]}, f)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не сохранил дневной итог: %s", e)
+
+
+def day_blocked(a):
+    """Достигнут --day-loss-usdt: новых сеток до следующих суток UTC не открываем."""
+    day_roll()
+    return a.day_loss_usdt > 0 and DAY["pnl"] <= -a.day_loss_usdt
 
 
 # ---------------------------------------------------------------- main
@@ -780,6 +850,17 @@ def main():
     p.add_argument("--max-er", type=float, default=0.5)
     p.add_argument("--fee", type=float, default=0.055, help="комиссия, %% (taker Bybit 0.055)")
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
+    # защита от пампов и лимиты убытка
+    p.add_argument("--max-24h", type=float, default=60,
+                   help="не торговать монету, если за 24ч цена изменилась больше чем на ±X %% (0 = выкл)")
+    p.add_argument("--max-move", type=float, default=4,
+                   help="не открывать сетку, если за окно сканера цена уже ушла больше чем на ±X %% (0 = выкл)")
+    p.add_argument("--trend-shifts", type=int, default=3,
+                   help="закрыть сетку, когда ей нужен N+1-й сдвиг подряд в одну сторону (памп/тренд); 0 = выкл")
+    p.add_argument("--max-loss-usdt", type=float, default=0,
+                   help="жёсткий потолок убытка на одну сетку, $ (поверх --max-loss и стопа сети; 0 = выкл)")
+    p.add_argument("--day-loss-usdt", type=float, default=0,
+                   help="за сутки UTC закрытые сетки дали минус ≥ X$ — новых сеток до завтра не открываю (0 = выкл)")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
     # нейросеть
@@ -862,6 +943,7 @@ def main():
         t = [x for x in t if x["symbol"] in inst and float(x.get("turnover24h") or 0) >= a.min_vol]
         t.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
         return [x["symbol"] for x in t]
+    day_load(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "day_pnl.json"))
     BRAIN = nn.Brain(a.nn_path, a, market, analyze, None, liquid)
     BRAIN.start()
     web.BRAIN = BRAIN
@@ -876,6 +958,10 @@ def main():
                 if web.CONTROL["msg"].startswith("Остановка"):
                     web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиция закрыта"
                 time.sleep(1)
+                continue
+            if day_blocked(a):
+                web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
+                pause_wait(60)
                 continue
             web.update(state="сканирую рынок", error="")
             try:
