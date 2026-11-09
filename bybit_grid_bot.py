@@ -893,11 +893,11 @@ def main():
     p.add_argument("--day-loss-usdt", type=float, default=15,
                    help="за сутки UTC закрытые сетки дали минус ≥ X$ — новых сеток до завтра не открываю (0 = выкл)")
     # размеры в %% от баланса (если > 0 — главнее долларовых --budget / --max-loss-usdt / --day-loss-usdt)
-    p.add_argument("--budget-pct", type=float, default=14,
+    p.add_argument("--budget-pct", type=float, default=25,
                    help="маржа на одну сетку, %% от баланса USDT (0 = брать --budget в $)")
-    p.add_argument("--max-loss-pct-bal", type=float, default=2.5,
+    p.add_argument("--max-loss-pct-bal", type=float, default=4.5,
                    help="потолок убытка на одну сетку, %% от баланса (0 = брать --max-loss-usdt в $)")
-    p.add_argument("--day-loss-pct-bal", type=float, default=5,
+    p.add_argument("--day-loss-pct-bal", type=float, default=8,
                    help="дневной лимит убытка, %% от баланса на начало суток UTC (0 = брать --day-loss-usdt в $)")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
