@@ -646,7 +646,8 @@ class Brain:
                 self._liquid = (self.symbols(), now)
             except Exception as e:  # noqa: BLE001
                 log.warning("Нейросеть: список монет: %s", e)
-        first = ([self.watch] if self.watch else []) + list(self.focus)
+        w = self.watch if isinstance(self.watch, (list, tuple)) else ([self.watch] if self.watch else [])
+        first = list(w) + list(self.focus)
         return list(dict.fromkeys(first + list(self._liquid[0])))[: self.a.nn_symbols]
 
     def refresh_candles(self, sym, now):

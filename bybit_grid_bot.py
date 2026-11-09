@@ -41,6 +41,7 @@ import os
 import shlex
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
@@ -320,7 +321,6 @@ def chase_flat(s, sym, ins, a, timeout, urgent=False):
 def brain_watch(s, a, grid):
     """Раз в минуту нейросеть переоценивает работающую сетку по текущему рынку.
     Если она решает и N минут подряд ждёт дальше минус — сетка закрывается досрочно (лимитками с догоном)."""
-    BRAIN.watch = grid.sym                        # учится и на этой монете
     try:
         kl = klines(s, grid.sym, a.window + 1)
         r = BRAIN.reassess(kl, grid.cfg)
@@ -512,14 +512,16 @@ class Grid:
         return self.realized + (self.price - self.lavg) * self.long + (self.savg - self.price) * self.short
 
     def publish(self):
-        web.update(grid={
+        info = {
             "symbol": self.sym, "lower": self.lower, "upper": self.upper, "levels": self.n,
             "step_pct": self.step_price / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
             "open_orders": len(self.live), "fills": self.fills, "profit": self.pnl(),
             "net": (f"L {self.long:g} / S {self.short:g}" if self.hedge else self.net), "shifts": self.shifts, "started": self.t0, "closing": self.closing,
             "budget": self.budget, "cfg": cfg_text(self.cfg, self.n, self.budget, self.a) if self.cfg else "",
             "nn_live": ({"best": self.nn_live["best"], "current": self.nn_live["current"], "bad": self.nn_bad}
-                        if self.nn_live else None)})
+                        if self.nn_live else None)}
+        with web.LOCK:
+            web.STATUS.setdefault("grids", {})[self.sym] = info
 
     # --- ордера
     def order_qty(self, i):
@@ -714,7 +716,7 @@ class Grid:
             web.STATUS["history"].append({"time": time.strftime("%d.%m %H:%M UTC", time.gmtime()), "symbol": self.sym,
                                           "fills": self.fills, "profit": self.pnl(), "reason": reason})
             web.STATUS["history"] = web.STATUS["history"][-100:]
-            web.STATUS["grid"] = None
+            web.STATUS.setdefault("grids", {}).pop(self.sym, None)
         return True
 
     def has_position(self):
@@ -752,16 +754,20 @@ def day_save():
             log.warning("Не сохранил дневной итог: %s", e)
 
 
+DAY_LOCK = threading.Lock()
+
+
 def day_add(pnl):
-    day_roll()
-    DAY["pnl"] += float(pnl)
-    day_save()
+    with DAY_LOCK:
+        day_roll()
+        DAY["pnl"] += float(pnl)
+        day_save()
 
 
 def sizing_from_balance(s, a):
     """Маржа на сетку, стоп и дневной лимит — в %% от баланса (если заданы --*-pct). Пересчёт перед каждым сканом:
     пополнил счёт — бот сам берёт больше, после минусов — меньше. Дневной лимит считается от баланса на начало суток UTC."""
-    if not (a.budget_pct > 0 or a.max_loss_pct_bal > 0 or a.day_loss_pct_bal > 0) or a.dry:
+    if a.dry:
         return
     try:
         bal = balance(s)
@@ -780,8 +786,14 @@ def sizing_from_balance(s, a):
         a.max_loss_usdt = round(bal * a.max_loss_pct_bal / 100, 2)
     if a.day_loss_pct_bal > 0:
         a.day_loss_usdt = round(DAY["bal"] * a.day_loss_pct_bal / 100, 2)
-    log.info("Размеры от баланса %.2f$: маржа на сетку %.2f$, стоп %.2f$, дневной лимит %.2f$ (за сутки %+.2f$)",
-             bal, a.budget, a.max_loss_usdt, a.day_loss_usdt, DAY["pnl"])
+    a.total_margin = bal * a.max_total_pct / 100 if a.max_total_pct > 0 else float("inf")
+    new = (round(a.budget, 2), round(a.max_loss_usdt, 2), round(a.day_loss_usdt, 2))
+    if getattr(a, "_sized", None) == new:
+        return
+    a._sized = new
+    log.info("Размеры от баланса %.2f$: маржа на сетку %.2f$, стоп %.2f$, дневной лимит %.2f$ (за сутки %+.2f$), "
+             "до %d сеток, вся маржа ≤ %.2f$", bal, a.budget, a.max_loss_usdt, a.day_loss_usdt, DAY["pnl"],
+             a.max_grids, a.total_margin)
     web.update(budget=a.budget)
 
 
@@ -893,12 +905,16 @@ def main():
     p.add_argument("--day-loss-usdt", type=float, default=15,
                    help="за сутки UTC закрытые сетки дали минус ≥ X$ — новых сеток до завтра не открываю (0 = выкл)")
     # размеры в %% от баланса (если > 0 — главнее долларовых --budget / --max-loss-usdt / --day-loss-usdt)
-    p.add_argument("--budget-pct", type=float, default=25,
+    p.add_argument("--budget-pct", type=float, default=10,
                    help="маржа на одну сетку, %% от баланса USDT (0 = брать --budget в $)")
-    p.add_argument("--max-loss-pct-bal", type=float, default=4.5,
+    p.add_argument("--max-loss-pct-bal", type=float, default=2,
                    help="потолок убытка на одну сетку, %% от баланса (0 = брать --max-loss-usdt в $)")
     p.add_argument("--day-loss-pct-bal", type=float, default=8,
                    help="дневной лимит убытка, %% от баланса на начало суток UTC (0 = брать --day-loss-usdt в $)")
+    # несколько сеток сразу
+    p.add_argument("--max-grids", type=int, default=5, help="сколько сеток на разных монетах держать одновременно")
+    p.add_argument("--max-total-pct", type=float, default=50,
+                   help="вся маржа всех сеток вместе — не больше X %% баланса")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
     # нейросеть
@@ -988,99 +1004,151 @@ def main():
     last_bal = time.time()
 
     cooldown = {}
-    grid = None
+    grids = []                     # работающие сетки (каждая — на своей монете)
+    a.total_margin = float("inf")
+    last_scan = 0.0
+
+    def finish(g, reason, timeout=None):
+        """Закрыть сетку; True — закрыта и убрана из списка."""
+        try:
+            if g.close(reason, timeout=timeout):
+                grids.remove(g)
+                cooldown[g.sym] = time.time() + a.cooldown * 60
+                return True
+        except Exception as e:  # noqa: BLE001
+            log.error("%s: ошибка закрытия: %s — повтор", g.sym, e)
+        return False
+
+    def pick(cands):
+        """Первая подходящая монета из скана, которой ещё нет среди сеток; маржа — в пределах общего лимита."""
+        busy = {g.sym for g in grids}
+        free = a.total_margin - sum(g.budget for g in grids)
+        if free < a.budget * 0.5:
+            log.info("Общая маржа сеток у лимита (%.2f$ из %.2f$) — новую не открываю",
+                     a.total_margin - free, a.total_margin)
+            return None
+        for c in cands:
+            if c["symbol"] in busy or cooldown.get(c["symbol"], 0) > time.time():
+                continue
+            if a.budget * float(c.get("size", 1.0)) > free:      # нейросеть хочет больше, чем осталось
+                c = {**c, "size": free / a.budget}
+            try:
+                try:
+                    g = Grid(s, a, c, inst[c["symbol"]])
+                except ValueError as e:
+                    if not c.get("nn_fallback"):
+                        raise
+                    # настройки сети не влезают в минимальный лот биржи — обычные настройки
+                    log.info("%s; беру обычные настройки", e)
+                    fb = c["nn_fallback"]
+                    c = {**c, "cfg": None, "size": min(1.0, free / a.budget), "grids": fb["levels"],
+                         "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
+                    g = Grid(s, a, c, inst[c["symbol"]])
+                if not a.dry and g.has_position():
+                    log.info("%s: уже есть позиция или ордера, пропускаю", c["symbol"])
+                    continue
+                return g, c
+            except ValueError as e:
+                log.info("%s", e)
+        return None
+
+    def state():
+        if grids:
+            web.update(state=f"сеток {len(grids)}/{a.max_grids}: " + ", ".join(g.sym for g in grids))
+
     try:
         while True:
-            if web.CONTROL["paused"]:
+            paused = web.CONTROL["paused"]
+            if paused and not grids:
                 web.update(state="на паузе — нажми «Старт» на странице")
                 if web.CONTROL["msg"].startswith("Остановка"):
-                    web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиция закрыта"
+                    web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиции закрыты"
                 time.sleep(1)
                 continue
-            sizing_from_balance(s, a)
-            if day_blocked(a):
-                web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
-                pause_wait(60)
-                continue
-            web.update(state="сканирую рынок", error="")
-            try:
-                cands = scan(s, inst, a)
-            except Exception as e:  # noqa: BLE001
-                log.error("Ошибка скана: %s", e)
-                web.update(error="Ошибка скана: %s" % e)
-                time.sleep(30)
-                continue
-            if web.CONTROL["paused"]:
-                continue
-            now = time.time()
-            cands = [c for c in cands if cooldown.get(c["symbol"], 0) < now]
-            grid = None
-            for c in cands:
-                try:
-                    try:
-                        g = Grid(s, a, c, inst[c["symbol"]])
-                    except ValueError as e:
-                        if not c.get("nn_fallback"):
-                            raise
-                        # настройки сети не влезают в минимальный лот биржи — обычные настройки
-                        log.info("%s; беру обычные настройки", e)
-                        fb = c["nn_fallback"]
-                        c = {**c, "cfg": None, "size": 1.0, "grids": fb["levels"],
-                             "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
-                        g = Grid(s, a, c, inst[c["symbol"]])
-                    if not a.dry and g.has_position():
-                        log.info("%s: уже есть позиция или ордера, пропускаю", c["symbol"])
+
+            # --- новая сетка: есть свободное место, раз в минуту (сразу, если сеток нет)
+            if not paused and len(grids) < a.max_grids and time.time() - last_scan >= (60 if grids else 0):
+                last_scan = time.time()
+                sizing_from_balance(s, a)
+                if day_blocked(a):
+                    if not grids:
+                        web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
+                        pause_wait(60)
                         continue
-                    grid = g
-                    break
-                except ValueError as e:
-                    log.info("%s", e)
-            if not grid:
-                log.info("Подходящих пар нет, жду 60 сек")
-                web.update(state="подходящих монет нет, жду")
-                pause_wait(60)
-                continue
+                else:
+                    if not grids:
+                        web.update(state="сканирую рынок", error="")
+                    try:
+                        cands = scan(s, inst, a)
+                    except Exception as e:  # noqa: BLE001
+                        log.error("Ошибка скана: %s", e)
+                        web.update(error="Ошибка скана: %s" % e)
+                        cands = []
+                    got = pick(cands) if cands and not web.CONTROL["paused"] else None
+                    if got:
+                        g, c = got
+                        g.start(c["price"])
+                        if a.dry:
+                            cooldown[g.sym] = time.time() + a.cooldown * 60
+                            pause_wait(60)
+                            continue
+                        else:
+                            grids.append(g)
+                    elif not grids:
+                        log.info("Подходящих пар нет, жду 60 сек")
+                        web.update(state="подходящих монет нет, жду")
+                        pause_wait(60)
+                        continue
+                    if BRAIN:
+                        BRAIN.watch = [g.sym for g in grids]       # учится и на монетах работающих сеток
+                    state()
+                if not grids:
+                    continue
 
-            web.update(state="ставлю сетку " + grid.sym)
-            grid.start(next(c["price"] for c in cands if c["symbol"] == grid.sym))
-            web.update(state="сетка работает: " + grid.sym)
-            if a.dry:
-                cooldown[grid.sym] = now + a.cooldown * 60
-                grid = None
-                pause_wait(60)
-                continue
-
-            while True:
-                time.sleep(a.poll)
-                reason = "стоп со страницы" if web.CONTROL["paused"] else grid.closing
+            # --- ведём все сетки
+            time.sleep(a.poll)
+            for g in list(grids):
+                reason = "стоп со страницы" if web.CONTROL["paused"] else g.closing
                 if not reason:
                     try:
-                        grid.sync()
-                        price = grid.last_price()
-                        grid.follow(price)
-                        reason = grid.check_exit(price)
-                        if not reason and BRAIN and time.time() - grid.nn_checked >= 60:
-                            grid.nn_checked = time.time()
-                            reason = brain_watch(s, a, grid)
-                        if time.time() - last_bal > 60:
-                            last_bal = time.time()
-                            balance(s)
+                        g.sync()
+                        price = g.last_price()
+                        g.follow(price)
+                        reason = g.check_exit(price)
+                        if not reason and BRAIN and time.time() - g.nn_checked >= 60:
+                            g.nn_checked = time.time()
+                            reason = brain_watch(s, a, g)
                     except Exception as e:  # noqa: BLE001
-                        log.error("Ошибка цикла: %s", e)
+                        log.error("%s: ошибка цикла: %s", g.sym, e)
                         continue
-                if reason:
-                    try:
-                        if grid.close(reason):
-                            break
-                    except Exception as e:  # noqa: BLE001
-                        log.error("Ошибка закрытия: %s — повтор", e)
-            cooldown[grid.sym] = time.time() + a.cooldown * 60
-            grid = None
+                if reason and finish(g, reason):
+                    state()
+            # --- дневной лимит с учётом открытых сеток: закрытые + текущий PnL всех сеток
+            if grids and a.day_loss_usdt > 0:
+                day_roll()
+                total = DAY["pnl"] + sum(g.pnl() for g in grids)
+                if total <= -a.day_loss_usdt:
+                    log.info("Дневной лимит: закрытые %+.2f$ + открытые %+.2f$ ≤ −%.2f$ — закрываю все сетки",
+                             DAY["pnl"], total - DAY["pnl"], a.day_loss_usdt)
+                    for g in list(grids):
+                        g.urgent = True
+                        finish(g, "дневной лимит убытка (вместе с открытыми сетками)")
+                    state()
+            if time.time() - last_bal > 60:
+                last_bal = time.time()
+                try:
+                    balance(s)
+                except Exception:  # noqa: BLE001
+                    pass
+            if not grids:
+                web.update(state="сканирую рынок")
     except KeyboardInterrupt:
         log.info("Остановка…")
-        if grid and not a.keep_on_exit and not a.dry:
-            web.update(state="перезапуск: закрываю позицию лимитками")
-            grid.close("перезапуск/остановка сервиса", timeout=a.term_timeout)
+        if grids and not a.keep_on_exit and not a.dry:
+            web.update(state="перезапуск: закрываю позиции лимитками")
+            # все сетки закрываем параллельно — у сервиса мало времени на остановку
+            with ThreadPoolExecutor(max_workers=len(grids)) as ex:
+                list(ex.map(lambda g: g.close("перезапуск/остановка сервиса", timeout=a.term_timeout), list(grids)))
 
 
 if __name__ == "__main__":

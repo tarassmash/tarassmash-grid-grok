@@ -206,9 +206,10 @@ def _fmt(v, nd=4):
 
 def render():
     s = snapshot()
-    g = s.get("grid")
-    if g:
-        grid_html = f"""
+    gl = list((s.get("grids") or {}).values()) or ([s["grid"]] if s.get("grid") else [])
+    grid_html = ""
+    for g in gl:
+        grid_html += f"""<h3 style="margin:14px 0 8px">{escape(g['symbol'])}</h3>
         <div class="kv">
           <div><span>Монета</span><b>{escape(g['symbol'])}</b></div>
           <div><span>Диапазон</span><b>{_fmt(g['lower'])} … {_fmt(g['upper'])}</b></div>
@@ -231,6 +232,10 @@ def render():
             grid_html += (f'<p class="muted small">Нейросеть ведёт сетку: дальше жду {lv["current"]:+.3f}% объёма с текущими '
                           f'настройками, {lv["best"]:+.3f}% с лучшими'
                           + (f' — минус {lv["bad"]} мин подряд, закрою досрочно на 3-й' if lv["bad"] else '') + '</p>')
+    if gl:
+        tot = sum(g.get("profit", 0) for g in gl)
+        grid_html = (f'<p class="small">Сеток: <b>{len(gl)}</b> · маржа <b>{sum(g.get("budget") or 0 for g in gl):.2f} $</b> · '
+                     f'PnL вместе ≈ <b class="{"pos" if tot >= 0 else "neg"}">{tot:+.3f} $</b></p>') + grid_html
     else:
         grid_html = '<p class="muted">Сейчас сетки нет — бот ищет монету.</p>'
 
@@ -320,7 +325,7 @@ pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mo
   <div><span>Маржа / плечо</span><b>{_fmt(s['budget'])} $ × {_fmt(s['leverage'])}</b></div>
   <div><span>Работает</span><b>{s['uptime_min']} мин</b></div>
 </div></div>
-<div class="panel"><h2>Текущая сетка</h2>{grid_html}</div>
+<div class="panel"><h2>Текущие сетки</h2>{grid_html}</div>
 <div class="panel"><h2>Последний скан · {scan_t} · проверено {s['scan']['checked']}, подошло {s['scan']['passed']}</h2>
 <div class="scroll"><table><tr><th>Монета</th><th>1m размах</th><th>ATR</th><th>ER</th><th>Score</th><th>Прогноз сети</th></tr>{rows}</table></div></div>
 {render_nn(s.get("nn"))}
