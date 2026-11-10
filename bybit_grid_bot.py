@@ -171,22 +171,27 @@ def scan(s, inst, a):
 
     def one(sym):
         try:
-            kl = klines(s, sym, a.window + 1)
+            kl_all = klines(s, sym, max(a.window, a.range_window) + 1)
+            kl = kl_all[-(a.window + 1):]
             m = analyze(kl, a)
         except Exception:  # noqa: BLE001
             return None
         if m:
             m["symbol"] = sym
             m["nn_base"] = nn.base_features(kl, m)
+            # боковик и за последний час: цена ходит туда-сюда, а не идёт в одну сторону
+            c = [float(k[4]) for k in kl_all]
+            path = sum(abs(c[i] - c[i - 1]) for i in range(1, len(c)))
+            m["er_long"] = abs(c[-1] - c[0]) / path if path > 0 else 1.0
+            m["move_long"] = (c[-1] / c[0] - 1) * 100
+            m["score"] = m["vol1m"] * (1 - m["er"]) * (1 - m["er_long"])
         return m
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res = [r for r in ex.map(one, syms) if r]
-    # когда нейросеть решает, сканер пропускает больше монет — выбирает и отсеивает уже она
-    relax = bool(BRAIN and a.nn and BRAIN.active)
-    max_er = a.nn_scan_max_er if relax else a.max_er
-    min_1m = a.min_1m * a.nn_scan_relax if relax else a.min_1m
-    res = [r for r in res if r["er"] <= max_er and r["turnover"] >= a.min_vol_win and r["vol1m"] >= min_1m]
+    # всегда (и когда решает нейросеть): только волатильные за минуту и только в боковике — за окно и за час
+    res = [r for r in res if r["er"] <= a.max_er and r["er_long"] <= a.max_er_long
+           and r["turnover"] >= a.min_vol_win and r["vol1m"] >= a.min_1m]
     # анти-памп: монета уже идёт рывком за окно — не встаём против движения (действует и когда решает сеть)
     if a.max_move > 0:
         moving = [r for r in res if abs(r["move"]) > a.max_move]
@@ -201,8 +206,8 @@ def scan(s, inst, a):
                      "top": [{**{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")},
                               "pred": r["nn"]["pred"], "levels": r["grids"]} for r in res[:10]]})
     for r in res[:5]:
-        log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f score=%.2f",
-                 r["symbol"], r["vol1m"], r["atr"], r["er"], r["score"])
+        log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f ER%dм=%.2f (%+.1f%%) score=%.2f",
+                 r["symbol"], r["vol1m"], r["atr"], r["er"], a.range_window, r["er_long"], r["move_long"], r["score"])
     return res
 
 
@@ -233,8 +238,7 @@ def apply_brain(res, a):
                         "levels": levels, "cfg": cfg, "feats": feats, "take": take, "size": r["size"]})
         if take:
             out.append(c)
-    if use:
-        out.sort(key=lambda c: c["nn"]["pred"], reverse=True)
+    # порядок — по волатильности в боковике (score сканера); сеть ставит настройки и отсеивает монеты с минусом
     decided.sort(key=lambda x: x["pred"] if x["pred"] is not None else -99, reverse=True)
     BRAIN.preds = [{"symbol": d["symbol"], "pred": d["pred"], "pred_default": d["pred_default"], "levels": d["levels"],
                     "cfg": nn.cfg_short(d["cfg"]), "size": d["size"], "take": d["take"]} for d in decided]
@@ -878,7 +882,9 @@ def main():
     p.add_argument("--min-vol", type=float, default=10e6, help="мин. оборот 24ч, USDT")
     p.add_argument("--min-vol-win", type=float, default=300e3, help="мин. оборот за окно, USDT")
     p.add_argument("--min-1m", type=float, default=0.5, help="мин. размах за минуту, %%")
-    p.add_argument("--max-er", type=float, default=0.5)
+    p.add_argument("--max-er", type=float, default=0.5, help="макс. трендовость за окно (0 — чистый боковик, 1 — прямая)")
+    p.add_argument("--range-window", type=int, default=60, help="второе окно для проверки боковика, мин")
+    p.add_argument("--max-er-long", type=float, default=0.4, help="макс. трендовость за --range-window")
     p.add_argument("--fee", type=float, default=0.055, help="комиссия, %% (taker Bybit 0.055)")
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
     # защита от пампов и лимиты убытка
@@ -914,9 +920,9 @@ def main():
     p.add_argument("--nn-eval-min", type=float, default=60, help="онлайн-проверка за последние N минут")
     p.add_argument("--nn-eval-min-n", type=int, default=20, help="минимум сделок в онлайн-проверке для решения")
     p.add_argument("--nn-max-hold", type=int, default=90, help="самая долгая сетка, которую может выбрать сеть, мин")
-    p.add_argument("--nn-scan-relax", type=float, default=0.5,
-                   help="когда сеть решает: мин. размах за минуту = --min-1m × X (сеть сама отсеет лишнее)")
-    p.add_argument("--nn-scan-max-er", type=float, default=0.9, help="когда сеть решает: макс. трендовость для скана")
+    # больше не используются (сканер всегда строгий); оставлены, чтобы старые BOT_ARGS не ломали запуск
+    p.add_argument("--nn-scan-relax", type=float, default=0.5, help=argparse.SUPPRESS)
+    p.add_argument("--nn-scan-max-er", type=float, default=0.9, help=argparse.SUPPRESS)
     p.add_argument("--nn-exit-edge", type=float, default=0.05,
                    help="сеть закрывает работающую сетку, если дальше ждёт минус больше X %% объёма")
     p.add_argument("--nn-exit-confirm", type=int, default=3, help="…столько минут подряд")
