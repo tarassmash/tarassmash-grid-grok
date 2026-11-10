@@ -528,17 +528,18 @@ class Grid:
         return self.want_qty.get(i) or self.lvl_qty.get(i) or self.qty
 
     def can_place(self, side, idx, q):
-        """Не даём позиции вырасти больше маржи × плечо, даже если сетка ушла за ценой."""
+        """Не даём позиции в одну сторону вырасти больше --max-inv от объёма сетки (маржа × плечо),
+        даже если сетка ушла за ценой: в тренде сетка не набирает всё против движения, а ждёт."""
         q = float(q)
         if self.hedge:
             if self.closes(side, idx):
                 return True
             same = sum(float(qq) for _, sd, ix, qq in self.live.values() if sd == side and ix == idx)
             cur = self.long if idx == 1 else self.short
-            return cur + same + q <= self.max_pos * 1.0001
+            return cur + same + q <= self.max_pos * self.a.max_inv * 1.0001
         same = sum(float(qq) for _, sd, _ix, qq in self.live.values() if sd == side)
         proj = (self.net if side == "Buy" else -self.net) + same + q
-        return proj <= self.max_pos * 1.0001
+        return proj <= self.max_pos * self.a.max_inv * 1.0001
 
     def place(self, i, side, idx):
         if self.a.dry:
@@ -708,6 +709,7 @@ class Grid:
             return False
         log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
         day_add(self.pnl())
+        coin_add(self.sym, self.pnl(), reason)
         if BRAIN and self.nn and self.notional > 0:
             pnl = self.pnl() - self.a.fee / 100 * abs(self.net) * self.price
             BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100, self.nn.get("pred"), self.sym)
@@ -801,6 +803,53 @@ def day_blocked(a):
     """Достигнут --day-loss-usdt: новых сеток до следующих суток UTC не открываем."""
     day_roll()
     return a.day_loss_usdt > 0 and DAY["pnl"] <= -a.day_loss_usdt
+
+
+# ---------------------------------------------------------------- память по монетам
+
+COINS = {"path": "", "hist": {}}   # монета -> [[время, PnL $, причина закрытия], ...] за последние 48 ч
+COINS_LOCK = threading.Lock()
+
+
+def coins_load(path):
+    COINS["path"] = path
+    try:
+        with open(path, encoding="utf-8") as f:
+            COINS["hist"] = json.load(f)
+    except Exception:  # noqa: BLE001
+        COINS["hist"] = {}
+
+
+def coin_add(sym, pnl, reason):
+    with COINS_LOCK:
+        now = time.time()
+        h = [x for x in COINS["hist"].get(sym, []) if now - x[0] < 48 * 3600]
+        h.append([now, round(float(pnl), 4), reason])
+        COINS["hist"][sym] = h
+        if COINS["path"]:
+            try:
+                with open(COINS["path"], "w", encoding="utf-8") as f:
+                    json.dump(COINS["hist"], f)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Не сохранил память по монетам: %s", e)
+
+
+def coin_blocked(sym, a):
+    """Почему монету сейчас брать нельзя ('' — можно): недавний крупный убыток или минус за 24 ч."""
+    h = COINS["hist"].get(sym) or []
+    if not h:
+        return ""
+    now = time.time()
+    bal = float(web.STATUS.get("balance") or 0) or a.budget * 10
+    big = bal * a.big_loss_pct / 100
+    t, pnl, reason = h[-1]
+    hard = any(k in reason for k in ("стоп", "памп", "тренд"))
+    if a.loss_cooldown > 0 and pnl < 0 and (pnl <= -big or hard) and now - t < a.loss_cooldown * 60:
+        return f"убыток {pnl:+.2f}$ ({reason}) {int((now - t) / 60)} мин назад — пауза {a.loss_cooldown} мин"
+    net = sum(x[1] for x in h if now - x[0] < 24 * 3600)
+    if a.coin_loss_pct > 0 and net <= -bal * a.coin_loss_pct / 100:
+        return f"за 24 ч по монете {net:+.2f}$"
+    return ""
 
 
 # ---------------------------------------------------------------- main
@@ -911,6 +960,14 @@ def main():
                    help="потолок убытка на одну сетку, %% от баланса (0 = брать --max-loss-usdt в $)")
     p.add_argument("--day-loss-pct-bal", type=float, default=8,
                    help="дневной лимит убытка, %% от баланса на начало суток UTC (0 = брать --day-loss-usdt в $)")
+    # умнее с трендом: не набирать всё против движения, помнить монеты, где теряли
+    p.add_argument("--max-inv", type=float, default=0.5,
+                   help="какую долю объёма сетки можно набрать в одну сторону (1 = весь объём, как раньше)")
+    p.add_argument("--loss-cooldown", type=int, default=180,
+                   help="мин паузы по монете после стопа/пампа/тренда или убытка ≥ --big-loss-pct (0 = выкл)")
+    p.add_argument("--big-loss-pct", type=float, default=1.0, help="крупный убыток сетки, %% баланса")
+    p.add_argument("--coin-loss-pct", type=float, default=1.0,
+                   help="монета дала за 24 ч минус ≥ X %% баланса — не беру, пока минус не уйдёт из окна (0 = выкл)")
     # несколько сеток сразу
     p.add_argument("--max-grids", type=int, default=5, help="сколько сеток на разных монетах держать одновременно")
     p.add_argument("--max-total-pct", type=float, default=50,
@@ -998,6 +1055,7 @@ def main():
         t.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
         return [x["symbol"] for x in t]
     day_load(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "day_pnl.json"))
+    coins_load(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "coins.json"))
     BRAIN = nn.Brain(a.nn_path, a, market, analyze, None, liquid)
     BRAIN.start()
     web.BRAIN = BRAIN
@@ -1027,8 +1085,13 @@ def main():
             log.info("Общая маржа сеток у лимита (%.2f$ из %.2f$) — новую не открываю",
                      a.total_margin - free, a.total_margin)
             return None
+        skipped = []
         for c in cands:
             if c["symbol"] in busy or cooldown.get(c["symbol"], 0) > time.time():
+                continue
+            why = coin_blocked(c["symbol"], a)
+            if why:
+                skipped.append(f"{c['symbol']}: {why}")
                 continue
             if a.budget * float(c.get("size", 1.0)) > free:      # нейросеть хочет больше, чем осталось
                 c = {**c, "size": free / a.budget}
@@ -1047,9 +1110,13 @@ def main():
                 if not a.dry and g.has_position():
                     log.info("%s: уже есть позиция или ордера, пропускаю", c["symbol"])
                     continue
+                if skipped:
+                    log.info("Память по монетам, пропускаю: %s", "; ".join(skipped))
                 return g, c
             except ValueError as e:
                 log.info("%s", e)
+        if skipped:
+            log.info("Память по монетам, пропускаю: %s", "; ".join(skipped))
         return None
 
     def state():
