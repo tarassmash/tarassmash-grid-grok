@@ -191,6 +191,7 @@ def scan(s, inst, a):
         res = [r for r in ex.map(one, syms) if r]
     # всегда (и когда решает нейросеть): только волатильные за минуту и только в боковике — за окно и за час
     res = [r for r in res if r["er"] <= a.max_er and r["er_long"] <= a.max_er_long
+           and (a.max_move_long <= 0 or abs(r["move_long"]) <= a.max_move_long)
            and r["turnover"] >= a.min_vol_win and r["vol1m"] >= a.min_1m]
     # анти-памп: монета уже идёт рывком за окно — не встаём против движения (действует и когда решает сеть)
     if a.max_move > 0:
@@ -885,6 +886,8 @@ def main():
     p.add_argument("--max-er", type=float, default=0.5, help="макс. трендовость за окно (0 — чистый боковик, 1 — прямая)")
     p.add_argument("--range-window", type=int, default=60, help="второе окно для проверки боковика, мин")
     p.add_argument("--max-er-long", type=float, default=0.4, help="макс. трендовость за --range-window")
+    p.add_argument("--max-move-long", type=float, default=8,
+                   help="за --range-window цена ушла не больше чем на ±X %% (иначе это не боковик; 0 = выкл)")
     p.add_argument("--fee", type=float, default=0.055, help="комиссия, %% (taker Bybit 0.055)")
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
     # защита от пампов и лимиты убытка
