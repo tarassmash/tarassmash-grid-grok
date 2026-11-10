@@ -181,7 +181,7 @@ def scan(s, inst, a):
             m["nn_base"] = nn.base_features(kl, m)
         return m
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:      # больше — упираемся в лимит запросов Bybit
         res = [r for r in ex.map(one, syms) if r]
     # когда нейросеть решает, сканер пропускает больше монет — выбирает и отсеивает уже она
     relax = bool(BRAIN and a.nn and BRAIN.active)
@@ -970,6 +970,8 @@ def main():
                    help="монета дала за 24 ч минус ≥ X %% баланса — не беру, пока минус не уйдёт из окна (0 = выкл)")
     # несколько сеток сразу
     p.add_argument("--max-grids", type=int, default=5, help="сколько сеток на разных монетах держать одновременно")
+    p.add_argument("--scan-every", type=int, default=180,
+                   help="сек между сканами, пока работают сетки (чаще — лимит запросов Bybit)")
     p.add_argument("--max-total-pct", type=float, default=50,
                    help="вся маржа всех сеток вместе — не больше X %% баланса")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
@@ -1134,7 +1136,7 @@ def main():
                 continue
 
             # --- новая сетка: есть свободное место, раз в минуту (сразу, если сеток нет)
-            if not paused and len(grids) < a.max_grids and time.time() - last_scan >= (60 if grids else 0):
+            if not paused and len(grids) < a.max_grids and time.time() - last_scan >= (a.scan_every if grids else 0):
                 last_scan = time.time()
                 sizing_from_balance(s, a)
                 if day_blocked(a):
