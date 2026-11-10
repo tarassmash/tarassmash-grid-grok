@@ -144,20 +144,19 @@ def vec(f):
 # ---------------------------------------------------------------- симулятор сетки по свечам
 
 def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pct, shift_steps=1.0, trace=None,
-                  geo=False, lotk=1.0, stop_pct=None, hold=None, tp_pct=0.0, trend_shifts=0, max_inv=1.0):
+                  geo=False, lotk=1.0, stop_pct=None, hold=None, tp_pct=0.0, trend_shifts=0):
     """Прогон нейтральной сетки бота по минутным свечам future [(o,h,l,c), ...].
 
     Те же правила, что у бота: geo — равный шаг в %, lotk — рост лота на каждый уровень от цены,
     встречный ордер ставится тем же объёмом, что исполнился; сдвиг за ценой через shift_steps шагов;
     стоп stop_pct % от объёма (или max_loss_pct % маржи); держим hold минут;
-    trend_shifts > 0 — закрываем, когда сетке нужен (trend_shifts+1)-й сдвиг подряд в ту же сторону (памп/тренд);
-    max_inv — какую долю объёма сетки можно набрать в одну сторону (дальше уровни против движения не исполняются).
+    trend_shifts > 0 — закрываем, когда сетке нужен (trend_shifts+1)-й сдвиг подряд в ту же сторону (памп/тренд).
     Внутри свечи цена идёт open→low→high→close (если свеча зелёная) или open→high→low→close.
     Возвращает доходность в % от объёма позиции (маржа × плечо).
     """
     width = upper - lower
     total = 1.0 / price            # объём всей сетки: 1 USDT по цене входа
-    max_pos = total * max_inv
+    max_pos = total
 
     def build(lo, hi, px):
         if geo:
@@ -647,8 +646,7 @@ class Brain:
                 self._liquid = (self.symbols(), now)
             except Exception as e:  # noqa: BLE001
                 log.warning("Нейросеть: список монет: %s", e)
-        w = self.watch if isinstance(self.watch, (list, tuple)) else ([self.watch] if self.watch else [])
-        first = list(w) + list(self.focus)
+        first = ([self.watch] if self.watch else []) + list(self.focus)
         return list(dict.fromkeys(first + list(self._liquid[0])))[: self.a.nn_symbols]
 
     def refresh_candles(self, sym, now):
@@ -739,7 +737,6 @@ class Brain:
                     r = simulate_grid(K[i0:i0 + h, 1:5], rec["price"], lo, hi, levels, a.fee, a.leverage, 0,
                                       cfg["shift"], geo=bool(cfg["geo"]), lotk=cfg["lotk"], stop_pct=cfg["stop"],
                                       tp_pct=cfg.get("tp", 0), trend_shifts=getattr(a, "trend_shifts", 0),
-                                      max_inv=getattr(a, "max_inv", 1.0),
                                       hold=h)
                     it["r"] = r
                     if mdl is not None and rec["t"] > self.trained_until:

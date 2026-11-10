@@ -41,7 +41,6 @@ import os
 import shlex
 import signal
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
@@ -181,7 +180,7 @@ def scan(s, inst, a):
             m["nn_base"] = nn.base_features(kl, m)
         return m
 
-    with ThreadPoolExecutor(max_workers=4) as ex:      # больше — упираемся в лимит запросов Bybit
+    with ThreadPoolExecutor(max_workers=6) as ex:
         res = [r for r in ex.map(one, syms) if r]
     # когда нейросеть решает, сканер пропускает больше монет — выбирает и отсеивает уже она
     relax = bool(BRAIN and a.nn and BRAIN.active)
@@ -321,6 +320,7 @@ def chase_flat(s, sym, ins, a, timeout, urgent=False):
 def brain_watch(s, a, grid):
     """Раз в минуту нейросеть переоценивает работающую сетку по текущему рынку.
     Если она решает и N минут подряд ждёт дальше минус — сетка закрывается досрочно (лимитками с догоном)."""
+    BRAIN.watch = grid.sym                        # учится и на этой монете
     try:
         kl = klines(s, grid.sym, a.window + 1)
         r = BRAIN.reassess(kl, grid.cfg)
@@ -512,34 +512,31 @@ class Grid:
         return self.realized + (self.price - self.lavg) * self.long + (self.savg - self.price) * self.short
 
     def publish(self):
-        info = {
+        web.update(grid={
             "symbol": self.sym, "lower": self.lower, "upper": self.upper, "levels": self.n,
             "step_pct": self.step_price / ((self.lower + self.upper) / 2) * 100, "qty": str(self.qty),
             "open_orders": len(self.live), "fills": self.fills, "profit": self.pnl(),
             "net": (f"L {self.long:g} / S {self.short:g}" if self.hedge else self.net), "shifts": self.shifts, "started": self.t0, "closing": self.closing,
             "budget": self.budget, "cfg": cfg_text(self.cfg, self.n, self.budget, self.a) if self.cfg else "",
             "nn_live": ({"best": self.nn_live["best"], "current": self.nn_live["current"], "bad": self.nn_bad}
-                        if self.nn_live else None)}
-        with web.LOCK:
-            web.STATUS.setdefault("grids", {})[self.sym] = info
+                        if self.nn_live else None)})
 
     # --- ордера
     def order_qty(self, i):
         return self.want_qty.get(i) or self.lvl_qty.get(i) or self.qty
 
     def can_place(self, side, idx, q):
-        """Не даём позиции в одну сторону вырасти больше --max-inv от объёма сетки (маржа × плечо),
-        даже если сетка ушла за ценой: в тренде сетка не набирает всё против движения, а ждёт."""
+        """Не даём позиции вырасти больше маржи × плечо, даже если сетка ушла за ценой."""
         q = float(q)
         if self.hedge:
             if self.closes(side, idx):
                 return True
             same = sum(float(qq) for _, sd, ix, qq in self.live.values() if sd == side and ix == idx)
             cur = self.long if idx == 1 else self.short
-            return cur + same + q <= self.max_pos * self.a.max_inv * 1.0001
+            return cur + same + q <= self.max_pos * 1.0001
         same = sum(float(qq) for _, sd, _ix, qq in self.live.values() if sd == side)
         proj = (self.net if side == "Buy" else -self.net) + same + q
-        return proj <= self.max_pos * self.a.max_inv * 1.0001
+        return proj <= self.max_pos * 1.0001
 
     def place(self, i, side, idx):
         if self.a.dry:
@@ -709,7 +706,6 @@ class Grid:
             return False
         log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
         day_add(self.pnl())
-        coin_add(self.sym, self.pnl(), reason)
         if BRAIN and self.nn and self.notional > 0:
             pnl = self.pnl() - self.a.fee / 100 * abs(self.net) * self.price
             BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100, self.nn.get("pred"), self.sym)
@@ -718,7 +714,7 @@ class Grid:
             web.STATUS["history"].append({"time": time.strftime("%d.%m %H:%M UTC", time.gmtime()), "symbol": self.sym,
                                           "fills": self.fills, "profit": self.pnl(), "reason": reason})
             web.STATUS["history"] = web.STATUS["history"][-100:]
-            web.STATUS.setdefault("grids", {}).pop(self.sym, None)
+            web.STATUS["grid"] = None
         return True
 
     def has_position(self):
@@ -756,20 +752,16 @@ def day_save():
             log.warning("Не сохранил дневной итог: %s", e)
 
 
-DAY_LOCK = threading.Lock()
-
-
 def day_add(pnl):
-    with DAY_LOCK:
-        day_roll()
-        DAY["pnl"] += float(pnl)
-        day_save()
+    day_roll()
+    DAY["pnl"] += float(pnl)
+    day_save()
 
 
 def sizing_from_balance(s, a):
     """Маржа на сетку, стоп и дневной лимит — в %% от баланса (если заданы --*-pct). Пересчёт перед каждым сканом:
     пополнил счёт — бот сам берёт больше, после минусов — меньше. Дневной лимит считается от баланса на начало суток UTC."""
-    if a.dry:
+    if not (a.budget_pct > 0 or a.max_loss_pct_bal > 0 or a.day_loss_pct_bal > 0) or a.dry:
         return
     try:
         bal = balance(s)
@@ -788,14 +780,8 @@ def sizing_from_balance(s, a):
         a.max_loss_usdt = round(bal * a.max_loss_pct_bal / 100, 2)
     if a.day_loss_pct_bal > 0:
         a.day_loss_usdt = round(DAY["bal"] * a.day_loss_pct_bal / 100, 2)
-    a.total_margin = bal * a.max_total_pct / 100 if a.max_total_pct > 0 else float("inf")
-    new = (round(a.budget, 2), round(a.max_loss_usdt, 2), round(a.day_loss_usdt, 2))
-    if getattr(a, "_sized", None) == new:
-        return
-    a._sized = new
-    log.info("Размеры от баланса %.2f$: маржа на сетку %.2f$, стоп %.2f$, дневной лимит %.2f$ (за сутки %+.2f$), "
-             "до %d сеток, вся маржа ≤ %.2f$", bal, a.budget, a.max_loss_usdt, a.day_loss_usdt, DAY["pnl"],
-             a.max_grids, a.total_margin)
+    log.info("Размеры от баланса %.2f$: маржа на сетку %.2f$, стоп %.2f$, дневной лимит %.2f$ (за сутки %+.2f$)",
+             bal, a.budget, a.max_loss_usdt, a.day_loss_usdt, DAY["pnl"])
     web.update(budget=a.budget)
 
 
@@ -803,53 +789,6 @@ def day_blocked(a):
     """Достигнут --day-loss-usdt: новых сеток до следующих суток UTC не открываем."""
     day_roll()
     return a.day_loss_usdt > 0 and DAY["pnl"] <= -a.day_loss_usdt
-
-
-# ---------------------------------------------------------------- память по монетам
-
-COINS = {"path": "", "hist": {}}   # монета -> [[время, PnL $, причина закрытия], ...] за последние 48 ч
-COINS_LOCK = threading.Lock()
-
-
-def coins_load(path):
-    COINS["path"] = path
-    try:
-        with open(path, encoding="utf-8") as f:
-            COINS["hist"] = json.load(f)
-    except Exception:  # noqa: BLE001
-        COINS["hist"] = {}
-
-
-def coin_add(sym, pnl, reason):
-    with COINS_LOCK:
-        now = time.time()
-        h = [x for x in COINS["hist"].get(sym, []) if now - x[0] < 48 * 3600]
-        h.append([now, round(float(pnl), 4), reason])
-        COINS["hist"][sym] = h
-        if COINS["path"]:
-            try:
-                with open(COINS["path"], "w", encoding="utf-8") as f:
-                    json.dump(COINS["hist"], f)
-            except Exception as e:  # noqa: BLE001
-                log.warning("Не сохранил память по монетам: %s", e)
-
-
-def coin_blocked(sym, a):
-    """Почему монету сейчас брать нельзя ('' — можно): недавний крупный убыток или минус за 24 ч."""
-    h = COINS["hist"].get(sym) or []
-    if not h:
-        return ""
-    now = time.time()
-    bal = float(web.STATUS.get("balance") or 0) or a.budget * 10
-    big = bal * a.big_loss_pct / 100
-    t, pnl, reason = h[-1]
-    hard = any(k in reason for k in ("стоп", "памп", "тренд"))
-    if a.loss_cooldown > 0 and pnl < 0 and (pnl <= -big or hard) and now - t < a.loss_cooldown * 60:
-        return f"убыток {pnl:+.2f}$ ({reason}) {int((now - t) / 60)} мин назад — пауза {a.loss_cooldown} мин"
-    net = sum(x[1] for x in h if now - x[0] < 24 * 3600)
-    if a.coin_loss_pct > 0 and net <= -bal * a.coin_loss_pct / 100:
-        return f"за 24 ч по монете {net:+.2f}$"
-    return ""
 
 
 # ---------------------------------------------------------------- main
@@ -954,26 +893,12 @@ def main():
     p.add_argument("--day-loss-usdt", type=float, default=15,
                    help="за сутки UTC закрытые сетки дали минус ≥ X$ — новых сеток до завтра не открываю (0 = выкл)")
     # размеры в %% от баланса (если > 0 — главнее долларовых --budget / --max-loss-usdt / --day-loss-usdt)
-    p.add_argument("--budget-pct", type=float, default=10,
+    p.add_argument("--budget-pct", type=float, default=25,
                    help="маржа на одну сетку, %% от баланса USDT (0 = брать --budget в $)")
-    p.add_argument("--max-loss-pct-bal", type=float, default=2,
+    p.add_argument("--max-loss-pct-bal", type=float, default=4.5,
                    help="потолок убытка на одну сетку, %% от баланса (0 = брать --max-loss-usdt в $)")
     p.add_argument("--day-loss-pct-bal", type=float, default=8,
                    help="дневной лимит убытка, %% от баланса на начало суток UTC (0 = брать --day-loss-usdt в $)")
-    # умнее с трендом: не набирать всё против движения, помнить монеты, где теряли
-    p.add_argument("--max-inv", type=float, default=0.5,
-                   help="какую долю объёма сетки можно набрать в одну сторону (1 = весь объём, как раньше)")
-    p.add_argument("--loss-cooldown", type=int, default=180,
-                   help="мин паузы по монете после стопа/пампа/тренда или убытка ≥ --big-loss-pct (0 = выкл)")
-    p.add_argument("--big-loss-pct", type=float, default=1.0, help="крупный убыток сетки, %% баланса")
-    p.add_argument("--coin-loss-pct", type=float, default=1.0,
-                   help="монета дала за 24 ч минус ≥ X %% баланса — не беру, пока минус не уйдёт из окна (0 = выкл)")
-    # несколько сеток сразу
-    p.add_argument("--max-grids", type=int, default=5, help="сколько сеток на разных монетах держать одновременно")
-    p.add_argument("--scan-every", type=int, default=180,
-                   help="сек между сканами, пока работают сетки (чаще — лимит запросов Bybit)")
-    p.add_argument("--max-total-pct", type=float, default=50,
-                   help="вся маржа всех сеток вместе — не больше X %% баланса")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
     # нейросеть
@@ -1057,167 +982,105 @@ def main():
         t.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
         return [x["symbol"] for x in t]
     day_load(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "day_pnl.json"))
-    coins_load(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "coins.json"))
     BRAIN = nn.Brain(a.nn_path, a, market, analyze, None, liquid)
     BRAIN.start()
     web.BRAIN = BRAIN
     last_bal = time.time()
 
     cooldown = {}
-    grids = []                     # работающие сетки (каждая — на своей монете)
-    a.total_margin = float("inf")
-    last_scan = 0.0
-
-    def finish(g, reason, timeout=None):
-        """Закрыть сетку; True — закрыта и убрана из списка."""
-        try:
-            if g.close(reason, timeout=timeout):
-                grids.remove(g)
-                cooldown[g.sym] = time.time() + a.cooldown * 60
-                return True
-        except Exception as e:  # noqa: BLE001
-            log.error("%s: ошибка закрытия: %s — повтор", g.sym, e)
-        return False
-
-    def pick(cands):
-        """Первая подходящая монета из скана, которой ещё нет среди сеток; маржа — в пределах общего лимита."""
-        busy = {g.sym for g in grids}
-        free = a.total_margin - sum(g.budget for g in grids)
-        if free < a.budget * 0.5:
-            log.info("Общая маржа сеток у лимита (%.2f$ из %.2f$) — новую не открываю",
-                     a.total_margin - free, a.total_margin)
-            return None
-        skipped = []
-        for c in cands:
-            if c["symbol"] in busy or cooldown.get(c["symbol"], 0) > time.time():
-                continue
-            why = coin_blocked(c["symbol"], a)
-            if why:
-                skipped.append(f"{c['symbol']}: {why}")
-                continue
-            if a.budget * float(c.get("size", 1.0)) > free:      # нейросеть хочет больше, чем осталось
-                c = {**c, "size": free / a.budget}
-            try:
-                try:
-                    g = Grid(s, a, c, inst[c["symbol"]])
-                except ValueError as e:
-                    if not c.get("nn_fallback"):
-                        raise
-                    # настройки сети не влезают в минимальный лот биржи — обычные настройки
-                    log.info("%s; беру обычные настройки", e)
-                    fb = c["nn_fallback"]
-                    c = {**c, "cfg": None, "size": min(1.0, free / a.budget), "grids": fb["levels"],
-                         "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
-                    g = Grid(s, a, c, inst[c["symbol"]])
-                if not a.dry and g.has_position():
-                    log.info("%s: уже есть позиция или ордера, пропускаю", c["symbol"])
-                    continue
-                if skipped:
-                    log.info("Память по монетам, пропускаю: %s", "; ".join(skipped))
-                return g, c
-            except ValueError as e:
-                log.info("%s", e)
-        if skipped:
-            log.info("Память по монетам, пропускаю: %s", "; ".join(skipped))
-        return None
-
-    def state():
-        if grids:
-            web.update(state=f"сеток {len(grids)}/{a.max_grids}: " + ", ".join(g.sym for g in grids))
-
+    grid = None
     try:
         while True:
-            paused = web.CONTROL["paused"]
-            if paused and not grids:
+            if web.CONTROL["paused"]:
                 web.update(state="на паузе — нажми «Старт» на странице")
                 if web.CONTROL["msg"].startswith("Остановка"):
-                    web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиции закрыты"
+                    web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиция закрыта"
                 time.sleep(1)
                 continue
-
-            # --- новая сетка: есть свободное место, раз в минуту (сразу, если сеток нет)
-            if not paused and len(grids) < a.max_grids and time.time() - last_scan >= (a.scan_every if grids else 0):
-                last_scan = time.time()
-                sizing_from_balance(s, a)
-                if day_blocked(a):
-                    if not grids:
-                        web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
-                        pause_wait(60)
-                        continue
-                else:
-                    if not grids:
-                        web.update(state="сканирую рынок", error="")
+            sizing_from_balance(s, a)
+            if day_blocked(a):
+                web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
+                pause_wait(60)
+                continue
+            web.update(state="сканирую рынок", error="")
+            try:
+                cands = scan(s, inst, a)
+            except Exception as e:  # noqa: BLE001
+                log.error("Ошибка скана: %s", e)
+                web.update(error="Ошибка скана: %s" % e)
+                time.sleep(30)
+                continue
+            if web.CONTROL["paused"]:
+                continue
+            now = time.time()
+            cands = [c for c in cands if cooldown.get(c["symbol"], 0) < now]
+            grid = None
+            for c in cands:
+                try:
                     try:
-                        cands = scan(s, inst, a)
-                    except Exception as e:  # noqa: BLE001
-                        log.error("Ошибка скана: %s", e)
-                        web.update(error="Ошибка скана: %s" % e)
-                        cands = []
-                    got = pick(cands) if cands and not web.CONTROL["paused"] else None
-                    if got:
-                        g, c = got
-                        g.start(c["price"])
-                        if a.dry:
-                            cooldown[g.sym] = time.time() + a.cooldown * 60
-                            pause_wait(60)
-                            continue
-                        else:
-                            grids.append(g)
-                    elif not grids:
-                        log.info("Подходящих пар нет, жду 60 сек")
-                        web.update(state="подходящих монет нет, жду")
-                        pause_wait(60)
+                        g = Grid(s, a, c, inst[c["symbol"]])
+                    except ValueError as e:
+                        if not c.get("nn_fallback"):
+                            raise
+                        # настройки сети не влезают в минимальный лот биржи — обычные настройки
+                        log.info("%s; беру обычные настройки", e)
+                        fb = c["nn_fallback"]
+                        c = {**c, "cfg": None, "size": 1.0, "grids": fb["levels"],
+                             "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
+                        g = Grid(s, a, c, inst[c["symbol"]])
+                    if not a.dry and g.has_position():
+                        log.info("%s: уже есть позиция или ордера, пропускаю", c["symbol"])
                         continue
-                    if BRAIN:
-                        BRAIN.watch = [g.sym for g in grids]       # учится и на монетах работающих сеток
-                    state()
-                if not grids:
-                    continue
+                    grid = g
+                    break
+                except ValueError as e:
+                    log.info("%s", e)
+            if not grid:
+                log.info("Подходящих пар нет, жду 60 сек")
+                web.update(state="подходящих монет нет, жду")
+                pause_wait(60)
+                continue
 
-            # --- ведём все сетки
-            time.sleep(a.poll)
-            for g in list(grids):
-                reason = "стоп со страницы" if web.CONTROL["paused"] else g.closing
+            web.update(state="ставлю сетку " + grid.sym)
+            grid.start(next(c["price"] for c in cands if c["symbol"] == grid.sym))
+            web.update(state="сетка работает: " + grid.sym)
+            if a.dry:
+                cooldown[grid.sym] = now + a.cooldown * 60
+                grid = None
+                pause_wait(60)
+                continue
+
+            while True:
+                time.sleep(a.poll)
+                reason = "стоп со страницы" if web.CONTROL["paused"] else grid.closing
                 if not reason:
                     try:
-                        g.sync()
-                        price = g.last_price()
-                        g.follow(price)
-                        reason = g.check_exit(price)
-                        if not reason and BRAIN and time.time() - g.nn_checked >= 60:
-                            g.nn_checked = time.time()
-                            reason = brain_watch(s, a, g)
+                        grid.sync()
+                        price = grid.last_price()
+                        grid.follow(price)
+                        reason = grid.check_exit(price)
+                        if not reason and BRAIN and time.time() - grid.nn_checked >= 60:
+                            grid.nn_checked = time.time()
+                            reason = brain_watch(s, a, grid)
+                        if time.time() - last_bal > 60:
+                            last_bal = time.time()
+                            balance(s)
                     except Exception as e:  # noqa: BLE001
-                        log.error("%s: ошибка цикла: %s", g.sym, e)
+                        log.error("Ошибка цикла: %s", e)
                         continue
-                if reason and finish(g, reason):
-                    state()
-            # --- дневной лимит с учётом открытых сеток: закрытые + текущий PnL всех сеток
-            if grids and a.day_loss_usdt > 0:
-                day_roll()
-                total = DAY["pnl"] + sum(g.pnl() for g in grids)
-                if total <= -a.day_loss_usdt:
-                    log.info("Дневной лимит: закрытые %+.2f$ + открытые %+.2f$ ≤ −%.2f$ — закрываю все сетки",
-                             DAY["pnl"], total - DAY["pnl"], a.day_loss_usdt)
-                    for g in list(grids):
-                        g.urgent = True
-                        finish(g, "дневной лимит убытка (вместе с открытыми сетками)")
-                    state()
-            if time.time() - last_bal > 60:
-                last_bal = time.time()
-                try:
-                    balance(s)
-                except Exception:  # noqa: BLE001
-                    pass
-            if not grids:
-                web.update(state="сканирую рынок")
+                if reason:
+                    try:
+                        if grid.close(reason):
+                            break
+                    except Exception as e:  # noqa: BLE001
+                        log.error("Ошибка закрытия: %s — повтор", e)
+            cooldown[grid.sym] = time.time() + a.cooldown * 60
+            grid = None
     except KeyboardInterrupt:
         log.info("Остановка…")
-        if grids and not a.keep_on_exit and not a.dry:
-            web.update(state="перезапуск: закрываю позиции лимитками")
-            # все сетки закрываем параллельно — у сервиса мало времени на остановку
-            with ThreadPoolExecutor(max_workers=len(grids)) as ex:
-                list(ex.map(lambda g: g.close("перезапуск/остановка сервиса", timeout=a.term_timeout), list(grids)))
+        if grid and not a.keep_on_exit and not a.dry:
+            web.update(state="перезапуск: закрываю позицию лимитками")
+            grid.close("перезапуск/остановка сервиса", timeout=a.term_timeout)
 
 
 if __name__ == "__main__":
