@@ -189,10 +189,26 @@ def scan(s, inst, a):
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res = [r for r in ex.map(one, syms) if r]
-    # всегда (и когда решает нейросеть): только волатильные за минуту и только в боковике — за окно и за час
-    res = [r for r in res if r["er"] <= a.max_er and r["er_long"] <= a.max_er_long
-           and (a.max_move_long <= 0 or abs(r["move_long"]) <= a.max_move_long)
-           and r["turnover"] >= a.min_vol_win and r["vol1m"] >= a.min_1m]
+    # всегда (и когда решает нейросеть): только волатильные за минуту и только в боковике — за окно и за час.
+    # Строгие пороги никого не пропустили — бот сам ослабляет их ступенями (не больше --relax-steps), чтобы
+    # не простаивать; на ослабленной ступени маржа меньше (× --relax-size за ступень). Анти-памп не ослабляется.
+    base = [r for r in res if r["turnover"] >= a.min_vol_win]
+    res, tier = [], 0
+    for tier in range(a.relax_steps + 1):
+        k = 1 + 0.25 * tier                      # ступень 1: пороги ×1.25, ступень 2: ×1.5
+        max_er, max_er_long = min(0.8, a.max_er * k), min(0.8, a.max_er_long * k)
+        max_move_long = a.max_move_long * k
+        min_1m = a.min_1m / k
+        res = [r for r in base if r["er"] <= max_er and r["er_long"] <= max_er_long
+               and (a.max_move_long <= 0 or abs(r["move_long"]) <= max_move_long) and r["vol1m"] >= min_1m]
+        if res:
+            break
+    if res and tier:
+        log.info("Строгий фильтр пуст — ослабил на %d ступ.: ER ≤ %.2f, ER%dм ≤ %.2f, за час ±%.0f%%, размах ≥ %.2f%%, "
+                 "маржа ×%.2f", tier, max_er, a.range_window, max_er_long, max_move_long, min_1m,
+                 a.relax_size ** tier)
+    for r in res:
+        r["tier"] = tier
     # анти-памп: монета уже идёт рывком за окно — не встаём против движения (действует и когда решает сеть)
     if a.max_move > 0:
         moving = [r for r in res if abs(r["move"]) > a.max_move]
@@ -202,6 +218,9 @@ def scan(s, inst, a):
         res = [r for r in res if abs(r["move"]) <= a.max_move]
     res.sort(key=lambda r: r["score"], reverse=True)
     res = apply_brain(res, a)
+    for r in res:
+        if r.get("tier"):
+            r["size"] = float(r.get("size", 1.0)) * a.relax_size ** r["tier"]
     log.info("Скан: %d пар по объёму, %d прошли фильтры", len(syms), len(res))
     web.update(scan={"time": time.time(), "checked": len(syms), "passed": len(res),
                      "top": [{**{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")},
@@ -886,6 +905,9 @@ def main():
     p.add_argument("--max-er", type=float, default=0.5, help="макс. трендовость за окно (0 — чистый боковик, 1 — прямая)")
     p.add_argument("--range-window", type=int, default=60, help="второе окно для проверки боковика, мин")
     p.add_argument("--max-er-long", type=float, default=0.4, help="макс. трендовость за --range-window")
+    p.add_argument("--relax-steps", type=int, default=2,
+                   help="если строгий фильтр пуст — сколько раз ослабить пороги на 25%% (0 = никогда, ждать)")
+    p.add_argument("--relax-size", type=float, default=0.7, help="маржа × X за каждую ступень ослабления")
     p.add_argument("--max-move-long", type=float, default=8,
                    help="за --range-window цена ушла не больше чем на ±X %% (иначе это не боковик; 0 = выкл)")
     p.add_argument("--fee", type=float, default=0.055, help="комиссия, %% (taker Bybit 0.055)")
@@ -1034,7 +1056,7 @@ def main():
                         # настройки сети не влезают в минимальный лот биржи — обычные настройки
                         log.info("%s; беру обычные настройки", e)
                         fb = c["nn_fallback"]
-                        c = {**c, "cfg": None, "size": 1.0, "grids": fb["levels"],
+                        c = {**c, "cfg": None, "size": a.relax_size ** c.get("tier", 0), "grids": fb["levels"],
                              "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
                         g = Grid(s, a, c, inst[c["symbol"]])
                     if not a.dry and g.has_position():
