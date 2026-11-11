@@ -144,13 +144,12 @@ def vec(f):
 # ---------------------------------------------------------------- симулятор сетки по свечам
 
 def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pct, shift_steps=1.0, trace=None,
-                  geo=False, lotk=1.0, stop_pct=None, hold=None, tp_pct=0.0, trend_shifts=0):
+                  geo=False, lotk=1.0, stop_pct=None, hold=None, tp_pct=0.0):
     """Прогон нейтральной сетки бота по минутным свечам future [(o,h,l,c), ...].
 
     Те же правила, что у бота: geo — равный шаг в %, lotk — рост лота на каждый уровень от цены,
     встречный ордер ставится тем же объёмом, что исполнился; сдвиг за ценой через shift_steps шагов;
-    стоп stop_pct % от объёма (или max_loss_pct % маржи); держим hold минут;
-    trend_shifts > 0 — закрываем, когда сетке нужен (trend_shifts+1)-й сдвиг подряд в ту же сторону (памп/тренд).
+    стоп stop_pct % от объёма (или max_loss_pct % маржи); держим hold минут.
     Внутри свечи цена идёт open→low→high→close (если свеча зелёная) или open→high→low→close.
     Возвращает доходность в % от объёма позиции (маржа × плечо).
     """
@@ -173,7 +172,6 @@ def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pc
 
     lv, want, step = build(lower, upper, price)
     net = avg = realized = 0.0
-    run_dir, run = 0, 0
     if stop_pct is not None:
         stop_at = -stop_pct / 100
     else:
@@ -234,11 +232,6 @@ def simulate_grid(future, price, lower, upper, n, fee_pct, leverage, max_loss_pc
             break
         edge = step * shift_steps
         if c > lv[-1] + edge or c < lv[0] - edge:
-            d = 1 if c > lv[-1] else -1
-            run = run + 1 if d == run_dir else 1
-            run_dir = d
-            if trend_shifts and run > trend_shifts:
-                break                       # памп/тренд: выходим, а не идём за ценой дальше
             lv, want, step = build(c - width / 2, c + width / 2, c)
     pnl = realized + (last - avg) * net - fee_pct / 100 * abs(net) * last   # закрытие лимитками
     return pnl * 100
@@ -362,7 +355,6 @@ class Brain:
         self.evals = collections.deque(maxlen=50000)   # онлайн-проверка: выбор сети vs обычные, по факту
         self.focus = []                 # монеты из последнего скана — учусь в первую очередь на них
         self.watch = None               # монета работающей сетки — учусь и на ней
-        self.chg24 = ({}, 0.0)          # изменение цены за 24ч по монетам (для анти-памп фильтра в онлайн-проверке)
         self._liquid = ([], 0.0)
         self.model, self.mu, self.sd = None, None, None
         self.trained_until = 0.0        # самое свежее время, которое модель уже видела
@@ -529,7 +521,7 @@ class Brain:
                f"Итог сетки узнаю, когда она отработает: короткой — через 10 мин, длинной — через {a.nn_max_hold} мин; "
                f"сейчас жду итог {len(self.pending):,} моментов"]
         if self.regime_hold:
-            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e and e.get("ok", True))
+            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e)
             out.append(f"Рынок сменился в {time.strftime('%H:%M UTC', time.gmtime(self.regime_start / 1000))}: "
                        f"решает бот с обычными настройками; жду итогов своих решений в новом режиме — "
                        f"{n_post} из {a.nn_regime_min_n}")
@@ -618,26 +610,6 @@ class Brain:
             return np.zeros((0, 7))
         return np.array([[float(x) for x in k[:7]] for k in rows])
 
-    def refresh_chg24(self):
-        """Изменение цены за 24ч по всем монетам, раз в 5 мин."""
-        if time.time() - self.chg24[1] < 300:
-            return
-        try:
-            lst = self.market.get_tickers(category="linear")["result"]["list"]
-            self.chg24 = ({t["symbol"]: float(t.get("price24hPcnt") or 0) * 100 for t in lst}, time.time())
-        except Exception as e:  # noqa: BLE001
-            log.warning("Нейросеть: изменение за 24ч: %s", str(e)[:100])
-
-    def tradable(self, sym, m):
-        """Прошёл бы момент анти-памп фильтры бота (--max-24h, --max-move). Онлайн-проверка меряет только такие:
-        на монетах, которые бот всё равно не возьмёт, выбор сети не важен. Учится сеть на всех моментах."""
-        a = self.a
-        if getattr(a, "max_move", 0) > 0 and abs(m.get("move", 0.0)) > a.max_move:
-            return False
-        if getattr(a, "max_24h", 0) > 0 and abs(self.chg24[0].get(sym, 0.0)) > a.max_24h:
-            return False
-        return True
-
     def learn_symbols(self):
         """Монеты для учёбы: сначала те, что сейчас дал сканер, потом самые ликвидные."""
         now = time.time()
@@ -693,7 +665,7 @@ class Brain:
             base = base_features(window, m)
             items = [{"cfg": dflt, "flag": 1}]
             items += [{"cfg": ALL_CONFIGS[i], "flag": 0} for i in self.rng.sample(list(self.allowed), a.nn_configs)]
-            rec = {"sym": sym, "t": float(t_end), "ok": self.tradable(sym, m), "gid": int(t_end // 60_000) * 65536 + (zlib.crc32(sym.encode()) & 0xFFFF),
+            rec = {"sym": sym, "t": float(t_end), "gid": int(t_end // 60_000) * 65536 + (zlib.crc32(sym.encode()) & 0xFFFF),
                    "price": m["price"], "lower": m["lower"], "upper": m["upper"], "base": base, "items": items,
                    "chosen": None, "pred": None, "took": None}
             if mdl is not None and t_end > self.trained_until:
@@ -736,7 +708,7 @@ class Brain:
                     lo, hi = grid_bounds(rec["lower"], rec["upper"], cfg["wmult"])
                     r = simulate_grid(K[i0:i0 + h, 1:5], rec["price"], lo, hi, levels, a.fee, a.leverage, 0,
                                       cfg["shift"], geo=bool(cfg["geo"]), lotk=cfg["lotk"], stop_pct=cfg["stop"],
-                                      tp_pct=cfg.get("tp", 0), trend_shifts=getattr(a, "trend_shifts", 0),
+                                      tp_pct=cfg.get("tp", 0),
                                       hold=h)
                     it["r"] = r
                     if mdl is not None and rec["t"] > self.trained_until:
@@ -751,12 +723,12 @@ class Brain:
                 rec["nlog"] = True
                 if rec["items"][c]["r"] is not None:
                     self.evals.append({"t": rec["t"], "tr": now, "sym": rec["sym"], "took": rec["took"],
-                                       "net": rec["items"][c]["r"], "pred": rec["pred"], "ok": rec.get("ok", True)})
+                                       "net": rec["items"][c]["r"], "pred": rec["pred"]})
                     self.cnt["evals"] += 1
             if not rec.get("dlog") and "r" in rec["items"][0]:
                 rec["dlog"] = True
                 if rec["items"][0]["r"] is not None:
-                    self.evals.append({"t": rec["t"], "tr": now, "dflt": rec["items"][0]["r"], "ok": rec.get("ok", True)})
+                    self.evals.append({"t": rec["t"], "tr": now, "dflt": rec["items"][0]["r"]})
             if all("r" in it for it in rec["items"]):
                 pass
             elif now - rec["t"] <= (HORIZON_MIN + 30) * 60_000:
@@ -767,8 +739,7 @@ class Brain:
     def online_metrics(self, now, minutes, since=None):
         """Онлайн-проверка: что дал выбор сети по факту против обычных настроек за последние `minutes` мин.
         since — учитывать только решения, принятые после смены рынка."""
-        W = [e for e in self.evals if e["tr"] >= now - minutes * 60_000 and (since is None or e["t"] >= since)
-             and e.get("ok", True)]
+        W = [e for e in self.evals if e["tr"] >= now - minutes * 60_000 and (since is None or e["t"] >= since)]
         E = [e for e in W if "net" in e]            # итоги выбора сети
         D = [e for e in W if "dflt" in e]           # итоги обычных настроек
         taken = [e for e in E if e["took"]]
@@ -815,7 +786,7 @@ class Brain:
         r = self.market_regime(syms)
         self.regime = r
         if self.regime_hold:
-            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e and e.get("ok", True))
+            n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e)
             if n_post >= a.nn_regime_min_n or now - self.regime_start >= a.nn_regime_max * 60_000:
                 self.regime_hold = False
                 self.regime_quiet = now + 10 * 60_000
@@ -937,7 +908,6 @@ class Brain:
         a = self.a
         now = time.time() * 1000
         first = not self.K
-        self.refresh_chg24()
         syms = self.learn_symbols()
         if first:
             self.think("data", f"Беру свежий рынок: последние {a.nn_window_hours:g} ч минутных свечей по {len(syms)} монетам",
@@ -1156,7 +1126,7 @@ class Brain:
         since = (self.regime_start if self.regime_start and now - self.regime_start < self.a.nn_eval_min * 60_000
                  else None)
         om = self.online_metrics(now, self.a.nn_eval_min, since=since)
-        n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e and e.get("ok", True)) if self.regime_hold else 0
+        n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e) if self.regime_hold else 0
         with self.lock:
             return {
                 "regime": self.regime, "regime_hold": self.regime_hold, "regime_start": self.regime_start,

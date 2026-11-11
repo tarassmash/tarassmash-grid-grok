@@ -35,7 +35,6 @@ Ctrl+C / остановка сервиса: бот снимет ордера и 
 """
 
 import argparse
-import json
 import logging
 import os
 import shlex
@@ -51,7 +50,6 @@ import nn
 import status_web as web
 
 BRAIN = None   # встроенная нейросеть (nn.Brain), создаётся в main()
-DAY = {"day": "", "pnl": 0.0, "bal": 0.0, "path": ""}   # итог закрытых сеток за текущие сутки UTC (для --day-loss-usdt)
 
 log = logging.getLogger("grid")
 CAT = "linear"
@@ -146,7 +144,6 @@ def analyze(kl, a):
     grids = max(2, min(a.max_levels, int(width / step_pct)))
     return {
         "price": price, "vol1m": vol1m, "atr": atr, "er": er, "turnover": sum(tv),
-        "move": (c[-1] / c[0] - 1) * 100,
         "score": vol1m * (1 - er), "lower": lower, "upper": upper, "grids": grids,
         "step_pct": width / grids,
     }
@@ -157,116 +154,38 @@ def klines(s, sym, n):
     return list(reversed(r["result"]["list"]))
 
 
-def scan_manual(s, inst, a, wanted):
-    """Монеты со страницы: торгуем их без фильтров сканера (решаешь ты). Несколько — сначала самая волатильная
-    за последнюю минуту в боковике. Защита внутри сетки (стоп, выход по пампу/тренду, дневной лимит) остаётся."""
-    bad = [x for x in wanted if x not in inst]
-    if bad and bad != getattr(scan_manual, "bad", None):          # пишем один раз, а не каждый скан
-        log.info("Таких фьючерсов на Bybit нет: %s", ", ".join(bad))
-        web.CONTROL["msg"] = "Нет на Bybit: " + ", ".join(bad)
-    scan_manual.bad = bad
-    res = []
-    for sym in [x for x in wanted if x in inst]:
-        try:
-            kl_all = klines(s, sym, max(a.window, a.range_window) + 1)
-            kl = kl_all[-(a.window + 1):]
-            m = analyze(kl, a)
-        except Exception as e:  # noqa: BLE001
-            log.info("%s: свечи не получил: %s", sym, str(e)[:100])
-            continue
-        if not m:
-            continue
-        m["symbol"] = sym
-        m["nn_base"] = nn.base_features(kl, m)
-        c = [float(k[4]) for k in kl_all]
-        path = sum(abs(c[i] - c[i - 1]) for i in range(1, len(c)))
-        m["er_long"] = abs(c[-1] - c[0]) / path if path > 0 else 1.0
-        m["move_long"] = (c[-1] / c[0] - 1) * 100
-        m["score"] = m["vol1m"] * (1 - m["er"]) * (1 - m["er_long"])
-        m["tier"], m["manual"] = 0, True
-        res.append(m)
-    res.sort(key=lambda r: r["score"], reverse=True)
-    res = apply_brain(res, a)
-    web.update(scan={"time": time.time(), "checked": len(wanted), "passed": len(res),
-                     "top": [{**{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")},
-                              "pred": r["nn"]["pred"], "levels": r["grids"]} for r in res[:10]]})
-    for r in res[:5]:
-        log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f ER%dм=%.2f (%+.1f%%) score=%.2f",
-                 r["symbol"], r["vol1m"], r["atr"], r["er"], a.range_window, r["er_long"], r["move_long"], r["score"])
-    return res
-
-
 def scan(s, inst, a):
     tick = api(s.get_tickers, category=CAT)["result"]["list"]
     syms = [t["symbol"] for t in tick
             if t["symbol"] in inst and float(t.get("turnover24h") or 0) >= a.min_vol]
-    # анти-памп: монета, которая за сутки уже улетела/упала больше --max-24h %, не торгуется совсем
-    chg24 = {t["symbol"]: float(t.get("price24hPcnt") or 0) * 100 for t in tick}
-    pumped = [x for x in syms if a.max_24h > 0 and abs(chg24.get(x, 0)) > a.max_24h]
-    if pumped:
-        log.info("Анти-памп: пропускаю (за 24ч > ±%g%%): %s", a.max_24h,
-                 ", ".join(f"{x} {chg24[x]:+.0f}%" for x in pumped[:8]))
-        syms = [x for x in syms if x not in pumped]
 
     def one(sym):
         try:
-            kl_all = klines(s, sym, max(a.window, a.range_window) + 1)
-            kl = kl_all[-(a.window + 1):]
+            kl = klines(s, sym, a.window + 1)
             m = analyze(kl, a)
         except Exception:  # noqa: BLE001
             return None
         if m:
             m["symbol"] = sym
             m["nn_base"] = nn.base_features(kl, m)
-            # боковик и за последний час: цена ходит туда-сюда, а не идёт в одну сторону
-            c = [float(k[4]) for k in kl_all]
-            path = sum(abs(c[i] - c[i - 1]) for i in range(1, len(c)))
-            m["er_long"] = abs(c[-1] - c[0]) / path if path > 0 else 1.0
-            m["move_long"] = (c[-1] / c[0] - 1) * 100
-            m["score"] = m["vol1m"] * (1 - m["er"]) * (1 - m["er_long"])
         return m
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res = [r for r in ex.map(one, syms) if r]
-    # всегда (и когда решает нейросеть): только волатильные за минуту и только в боковике — за окно и за час.
-    # Строгие пороги никого не пропустили — бот сам ослабляет их ступенями (не больше --relax-steps), чтобы
-    # не простаивать; на ослабленной ступени маржа меньше (× --relax-size за ступень). Анти-памп не ослабляется.
-    base = [r for r in res if r["turnover"] >= a.min_vol_win]
-    res, tier = [], 0
-    for tier in range(a.relax_steps + 1):
-        k = 1 + 0.25 * tier                      # ступень 1: пороги ×1.25, ступень 2: ×1.5
-        max_er, max_er_long = min(0.8, a.max_er * k), min(0.8, a.max_er_long * k)
-        max_move_long = a.max_move_long * k
-        min_1m = a.min_1m / k
-        res = [r for r in base if r["er"] <= max_er and r["er_long"] <= max_er_long
-               and (a.max_move_long <= 0 or abs(r["move_long"]) <= max_move_long) and r["vol1m"] >= min_1m]
-        if res:
-            break
-    if res and tier:
-        log.info("Строгий фильтр пуст — ослабил на %d ступ.: ER ≤ %.2f, ER%dм ≤ %.2f, за час ±%.0f%%, размах ≥ %.2f%%, "
-                 "маржа ×%.2f", tier, max_er, a.range_window, max_er_long, max_move_long, min_1m,
-                 a.relax_size ** tier)
-    for r in res:
-        r["tier"] = tier
-    # анти-памп: монета уже идёт рывком за окно — не встаём против движения (действует и когда решает сеть)
-    if a.max_move > 0:
-        moving = [r for r in res if abs(r["move"]) > a.max_move]
-        if moving:
-            log.info("Анти-памп: пропускаю (за %d мин > ±%g%%): %s", a.window, a.max_move,
-                     ", ".join(f"{r['symbol']} {r['move']:+.1f}%" for r in moving[:8]))
-        res = [r for r in res if abs(r["move"]) <= a.max_move]
+    # когда нейросеть решает, сканер пропускает больше монет — выбирает и отсеивает уже она
+    relax = bool(BRAIN and a.nn and BRAIN.active)
+    max_er = a.nn_scan_max_er if relax else a.max_er
+    min_1m = a.min_1m * a.nn_scan_relax if relax else a.min_1m
+    res = [r for r in res if r["er"] <= max_er and r["turnover"] >= a.min_vol_win and r["vol1m"] >= min_1m]
     res.sort(key=lambda r: r["score"], reverse=True)
     res = apply_brain(res, a)
-    for r in res:
-        if r.get("tier"):
-            r["size"] = float(r.get("size", 1.0)) * a.relax_size ** r["tier"]
     log.info("Скан: %d пар по объёму, %d прошли фильтры", len(syms), len(res))
     web.update(scan={"time": time.time(), "checked": len(syms), "passed": len(res),
                      "top": [{**{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")},
                               "pred": r["nn"]["pred"], "levels": r["grids"]} for r in res[:10]]})
     for r in res[:5]:
-        log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f ER%dм=%.2f (%+.1f%%) score=%.2f",
-                 r["symbol"], r["vol1m"], r["atr"], r["er"], a.range_window, r["er_long"], r["move_long"], r["score"])
+        log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f score=%.2f",
+                 r["symbol"], r["vol1m"], r["atr"], r["er"], r["score"])
     return res
 
 
@@ -285,11 +204,7 @@ def apply_brain(res, a):
             continue
         cfg, levels, pred, feats = r["best"]
         dcfg, dlevels, dpred, dfeats = r["default"]
-        if use and c.get("manual") and not (pred is not None and pred > a.nn_min_edge):
-            # монету выбрал ты, а сеть ждёт минус — торгуем обычными настройками, не пропускаем
-            take = True
-            c["nn"] = {"pred": dpred, "feats": dfeats, "levels": dlevels, "cfg": None}
-        elif use:
+        if use:
             take = pred is not None and pred > a.nn_min_edge
             c["cfg"], c["grids"], c["size"] = cfg, levels, r["size"]
             c["nn"] = {"pred": pred, "feats": feats, "levels": levels, "cfg": cfg}
@@ -301,7 +216,8 @@ def apply_brain(res, a):
                         "levels": levels, "cfg": cfg, "feats": feats, "take": take, "size": r["size"]})
         if take:
             out.append(c)
-    # порядок — по волатильности в боковике (score сканера); сеть ставит настройки и отсеивает монеты с минусом
+    if use:
+        out.sort(key=lambda c: c["nn"]["pred"], reverse=True)
     decided.sort(key=lambda x: x["pred"] if x["pred"] is not None else -99, reverse=True)
     BRAIN.preds = [{"symbol": d["symbol"], "pred": d["pred"], "pred_default": d["pred_default"], "levels": d["levels"],
                     "cfg": nn.cfg_short(d["cfg"]), "size": d["size"], "take": d["take"]} for d in decided]
@@ -337,7 +253,7 @@ def is_hedge(s, sym):
     return any(int(p.get("positionIdx") or 0) in (1, 2) for p in r["result"]["list"])
 
 
-def chase_flat(s, sym, ins, a, timeout, urgent=False):
+def chase_flat(s, sym, ins, a, timeout):
     """Закрыть позицию ТОЛЬКО лимитками с догоном (без маркета).
 
     Сначала мейкер-лимитка у лучшей цены (PostOnly), через --chase-sec снимаем и
@@ -346,7 +262,7 @@ def chase_flat(s, sym, ins, a, timeout, urgent=False):
     """
     tick = ins["tick"]
     t_end = time.time() + timeout
-    tries = a.chase_tries if urgent else 0     # стоп/памп: сразу быстрая лимитка через спред, без ожидания мейкером
+    tries = 0
     while time.time() < t_end:
         side, size, idx = position(s, sym)
         if size <= 0:
@@ -444,8 +360,6 @@ class Grid:
             self.stop_usdt = self.budget * self.lev * float(cfg["stop"]) / 100
         else:
             self.stop_usdt = self.budget * a.max_loss / 100 if a.max_loss > 0 else None
-        if a.max_loss_usdt > 0:                            # жёсткий потолок убытка на сетку в $
-            self.stop_usdt = min(self.stop_usdt, a.max_loss_usdt) if self.stop_usdt else a.max_loss_usdt
         # тейк-профит сетки от нейросети (% от объёма); иначе — --tp-usdt
         self.tp_usdt = (self.budget * self.lev * float(cfg["tp"]) / 100 if cfg.get("tp")
                         else (a.tp_usdt if a.tp_usdt > 0 else None))
@@ -479,9 +393,6 @@ class Grid:
         self.price = float(price)
         self.er_checked = 0.0
         self.closing = ""
-        self.urgent = False             # закрывать сразу через спред (стоп, памп)
-        self.trend_dir, self.trend_run = 0, 0   # сдвиги подряд в одну сторону
-        self.trend_exit = ""
         self.nn = cand.get("nn")
         self.notional = float(self.total) * float(price)
         self.nn_checked = time.time()
@@ -702,14 +613,6 @@ class Grid:
             self.out_since = time.time()
         if time.time() - self.out_since < self.a.shift_sec:
             return
-        d = 1 if price > self.upper else -1
-        self.trend_run = self.trend_run + 1 if d == self.trend_dir else 1
-        self.trend_dir = d
-        if self.a.trend_shifts > 0 and self.trend_run > self.a.trend_shifts:
-            # цена уходит рывками в одну сторону: не догоняем её дальше (позиция уже против движения), выходим
-            self.trend_exit = (f"памп/тренд: {self.a.trend_shifts} сдвига подряд "
-                               f"{'вверх' if d > 0 else 'вниз'}, цена ушла снова")
-            return
         half = (self.upper - self.lower) / 2
         self.cancel_grid()
         self.set_levels(price - half, price + half)
@@ -740,16 +643,12 @@ class Grid:
         self.publish()
 
     def check_exit(self, price):
-        if self.trend_exit:
-            self.urgent = True
-            return self.trend_exit
         if (time.time() - self.t0) / 60 >= self.hold:
             return "истекло время"
         pnl = self.pnl()
         if self.tp_usdt and pnl >= self.tp_usdt:
             return f"тейк-профит {pnl:.2f}$"
         if self.stop_usdt and pnl <= -self.stop_usdt:
-            self.urgent = True
             return f"стоп по убытку {pnl:.2f}$"
         if self.a.exit_er > 0 and time.time() - self.er_checked > 30:
             self.er_checked = time.time()
@@ -767,12 +666,11 @@ class Grid:
         if self.a.dry:
             return True
         self.cancel_grid()
-        ok = chase_flat(self.s, self.sym, self.ins, self.a, timeout or self.a.close_timeout, urgent=self.urgent)
+        ok = chase_flat(self.s, self.sym, self.ins, self.a, timeout or self.a.close_timeout)
         if not ok:
             log.error("%s: позиция ещё не закрыта, продолжаю догон лимитками", self.sym)
             return False
         log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
-        day_add(self.pnl())
         if BRAIN and self.nn and self.notional > 0:
             pnl = self.pnl() - self.a.fee / 100 * abs(self.net) * self.price
             BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100, self.nn.get("pred"), self.sym)
@@ -790,72 +688,6 @@ class Grid:
             return True
         o = api(self.s.get_open_orders, category=CAT, symbol=self.sym, limit=1)
         return bool(o["result"]["list"])
-
-
-# ---------------------------------------------------------------- дневной лимит убытка
-
-def day_load(path):
-    DAY["path"] = path
-    try:
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-        DAY["day"], DAY["pnl"], DAY["bal"] = d.get("day", ""), float(d.get("pnl", 0)), float(d.get("bal", 0))
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def day_roll():
-    today = time.strftime("%Y-%m-%d", time.gmtime())
-    if DAY["day"] != today:
-        DAY["day"], DAY["pnl"], DAY["bal"] = today, 0.0, 0.0
-
-
-def day_save():
-    if DAY["path"]:
-        try:
-            with open(DAY["path"], "w", encoding="utf-8") as f:
-                json.dump({"day": DAY["day"], "pnl": DAY["pnl"], "bal": DAY["bal"]}, f)
-        except Exception as e:  # noqa: BLE001
-            log.warning("Не сохранил дневной итог: %s", e)
-
-
-def day_add(pnl):
-    day_roll()
-    DAY["pnl"] += float(pnl)
-    day_save()
-
-
-def sizing_from_balance(s, a):
-    """Маржа на сетку, стоп и дневной лимит — в %% от баланса (если заданы --*-pct). Пересчёт перед каждым сканом:
-    пополнил счёт — бот сам берёт больше, после минусов — меньше. Дневной лимит считается от баланса на начало суток UTC."""
-    if not (a.budget_pct > 0 or a.max_loss_pct_bal > 0 or a.day_loss_pct_bal > 0) or a.dry:
-        return
-    try:
-        bal = balance(s)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Баланс не получил (%s), оставляю прошлые размеры", str(e)[:100])
-        return
-    if bal <= 0:
-        return
-    day_roll()
-    if DAY["bal"] <= 0:
-        DAY["bal"] = bal
-        day_save()
-    if a.budget_pct > 0:
-        a.budget = round(bal * a.budget_pct / 100, 2)
-    if a.max_loss_pct_bal > 0:
-        a.max_loss_usdt = round(bal * a.max_loss_pct_bal / 100, 2)
-    if a.day_loss_pct_bal > 0:
-        a.day_loss_usdt = round(DAY["bal"] * a.day_loss_pct_bal / 100, 2)
-    log.info("Размеры от баланса %.2f$: маржа на сетку %.2f$, стоп %.2f$, дневной лимит %.2f$ (за сутки %+.2f$)",
-             bal, a.budget, a.max_loss_usdt, a.day_loss_usdt, DAY["pnl"])
-    web.update(budget=a.budget)
-
-
-def day_blocked(a):
-    """Достигнут --day-loss-usdt: новых сеток до следующих суток UTC не открываем."""
-    day_roll()
-    return a.day_loss_usdt > 0 and DAY["pnl"] <= -a.day_loss_usdt
 
 
 # ---------------------------------------------------------------- main
@@ -940,42 +772,14 @@ def main():
     p.add_argument("--chase-slip", type=int, default=5, help="быстрая лимитка: макс. тиков за лучшей ценой")
     p.add_argument("--close-timeout", type=float, default=120, help="сек на одну серию догона")
     p.add_argument("--cooldown", type=float, default=30, help="пауза для пары после закрытия, мин")
-    p.add_argument("--symbols", default="", help="монеты для торговли через запятую (страница главнее)")
-    p.add_argument("--auto-scan", action="store_true",
-                   help="если монеты не заданы — искать самому (по умолчанию бот ждёт, пока впишешь монету)")
     # сканер
     p.add_argument("--window", type=int, default=15, help="окно, 1m свечей")
     p.add_argument("--min-vol", type=float, default=10e6, help="мин. оборот 24ч, USDT")
     p.add_argument("--min-vol-win", type=float, default=300e3, help="мин. оборот за окно, USDT")
     p.add_argument("--min-1m", type=float, default=0.5, help="мин. размах за минуту, %%")
-    p.add_argument("--max-er", type=float, default=0.5, help="макс. трендовость за окно (0 — чистый боковик, 1 — прямая)")
-    p.add_argument("--range-window", type=int, default=60, help="второе окно для проверки боковика, мин")
-    p.add_argument("--max-er-long", type=float, default=0.4, help="макс. трендовость за --range-window")
-    p.add_argument("--relax-steps", type=int, default=2,
-                   help="если строгий фильтр пуст — сколько раз ослабить пороги на 25%% (0 = никогда, ждать)")
-    p.add_argument("--relax-size", type=float, default=0.7, help="маржа × X за каждую ступень ослабления")
-    p.add_argument("--max-move-long", type=float, default=8,
-                   help="за --range-window цена ушла не больше чем на ±X %% (иначе это не боковик; 0 = выкл)")
+    p.add_argument("--max-er", type=float, default=0.5)
     p.add_argument("--fee", type=float, default=0.055, help="комиссия, %% (taker Bybit 0.055)")
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
-    # защита от пампов и лимиты убытка
-    p.add_argument("--max-24h", type=float, default=60,
-                   help="не торговать монету, если за 24ч цена изменилась больше чем на ±X %% (0 = выкл)")
-    p.add_argument("--max-move", type=float, default=4,
-                   help="не открывать сетку, если за окно сканера цена уже ушла больше чем на ±X %% (0 = выкл)")
-    p.add_argument("--trend-shifts", type=int, default=3,
-                   help="закрыть сетку, когда ей нужен N+1-й сдвиг подряд в одну сторону (памп/тренд); 0 = выкл")
-    p.add_argument("--max-loss-usdt", type=float, default=4,
-                   help="жёсткий потолок убытка на одну сетку, $ (поверх --max-loss и стопа сети; 0 = выкл)")
-    p.add_argument("--day-loss-usdt", type=float, default=15,
-                   help="за сутки UTC закрытые сетки дали минус ≥ X$ — новых сеток до завтра не открываю (0 = выкл)")
-    # размеры в %% от баланса (если > 0 — главнее долларовых --budget / --max-loss-usdt / --day-loss-usdt)
-    p.add_argument("--budget-pct", type=float, default=25,
-                   help="маржа на одну сетку, %% от баланса USDT (0 = брать --budget в $)")
-    p.add_argument("--max-loss-pct-bal", type=float, default=4.5,
-                   help="потолок убытка на одну сетку, %% от баланса (0 = брать --max-loss-usdt в $)")
-    p.add_argument("--day-loss-pct-bal", type=float, default=8,
-                   help="дневной лимит убытка, %% от баланса на начало суток UTC (0 = брать --day-loss-usdt в $)")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
     # нейросеть
@@ -991,9 +795,9 @@ def main():
     p.add_argument("--nn-eval-min", type=float, default=60, help="онлайн-проверка за последние N минут")
     p.add_argument("--nn-eval-min-n", type=int, default=20, help="минимум сделок в онлайн-проверке для решения")
     p.add_argument("--nn-max-hold", type=int, default=90, help="самая долгая сетка, которую может выбрать сеть, мин")
-    # больше не используются (сканер всегда строгий); оставлены, чтобы старые BOT_ARGS не ломали запуск
-    p.add_argument("--nn-scan-relax", type=float, default=0.5, help=argparse.SUPPRESS)
-    p.add_argument("--nn-scan-max-er", type=float, default=0.9, help=argparse.SUPPRESS)
+    p.add_argument("--nn-scan-relax", type=float, default=0.5,
+                   help="когда сеть решает: мин. размах за минуту = --min-1m × X (сеть сама отсеет лишнее)")
+    p.add_argument("--nn-scan-max-er", type=float, default=0.9, help="когда сеть решает: макс. трендовость для скана")
     p.add_argument("--nn-exit-edge", type=float, default=0.05,
                    help="сеть закрывает работающую сетку, если дальше ждёт минус больше X %% объёма")
     p.add_argument("--nn-exit-confirm", type=int, default=3, help="…столько минут подряд")
@@ -1058,11 +862,6 @@ def main():
         t = [x for x in t if x["symbol"] in inst and float(x.get("turnover24h") or 0) >= a.min_vol]
         t.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
         return [x["symbol"] for x in t]
-    day_load(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "day_pnl.json"))
-    web.load_symbols(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "symbols.json"))
-    if a.symbols:                                   # монеты из BOT_ARGS — если на странице ещё ничего не задано
-        web.CONTROL["symbols"] = web.CONTROL["symbols"] or web.parse_symbols(a.symbols)
-    log.info("Монеты для торговли: %s", ", ".join(web.CONTROL["symbols"]) or "не заданы — впиши на странице")
     BRAIN = nn.Brain(a.nn_path, a, market, analyze, None, liquid)
     BRAIN.start()
     web.BRAIN = BRAIN
@@ -1078,19 +877,9 @@ def main():
                     web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиция закрыта"
                 time.sleep(1)
                 continue
-            sizing_from_balance(s, a)
-            if day_blocked(a):
-                web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
-                pause_wait(60)
-                continue
-            wanted = list(web.CONTROL["symbols"])
-            if not wanted and not a.auto_scan:
-                web.update(state="жду монету — впиши её на странице и нажми «Сохранить монеты»")
-                pause_wait(5)
-                continue
-            web.update(state=("проверяю монеты: " + ", ".join(wanted)) if wanted else "сканирую рынок", error="")
+            web.update(state="сканирую рынок", error="")
             try:
-                cands = scan_manual(s, inst, a, wanted) if wanted else scan(s, inst, a)
+                cands = scan(s, inst, a)
             except Exception as e:  # noqa: BLE001
                 log.error("Ошибка скана: %s", e)
                 web.update(error="Ошибка скана: %s" % e)
@@ -1111,7 +900,7 @@ def main():
                         # настройки сети не влезают в минимальный лот биржи — обычные настройки
                         log.info("%s; беру обычные настройки", e)
                         fb = c["nn_fallback"]
-                        c = {**c, "cfg": None, "size": a.relax_size ** c.get("tier", 0), "grids": fb["levels"],
+                        c = {**c, "cfg": None, "size": 1.0, "grids": fb["levels"],
                              "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
                         g = Grid(s, a, c, inst[c["symbol"]])
                     if not a.dry and g.has_position():
@@ -1122,11 +911,6 @@ def main():
                 except ValueError as e:
                     log.info("%s", e)
             if not grid:
-                if wanted:
-                    log.info("Монеты со страницы сейчас взять нельзя (пауза после стопа или уже есть позиция), жду")
-                    web.update(state="монеты со страницы на паузе или заняты, жду")
-                    pause_wait(20)
-                    continue
                 log.info("Подходящих пар нет, жду 60 сек")
                 web.update(state="подходящих монет нет, жду")
                 pause_wait(60)
@@ -1144,8 +928,6 @@ def main():
             while True:
                 time.sleep(a.poll)
                 reason = "стоп со страницы" if web.CONTROL["paused"] else grid.closing
-                if not reason and (web.CONTROL["symbols"] or not a.auto_scan) and grid.sym not in web.CONTROL["symbols"]:
-                    reason = "монету убрали со страницы"
                 if not reason:
                     try:
                         grid.sync()
@@ -1167,10 +949,7 @@ def main():
                             break
                     except Exception as e:  # noqa: BLE001
                         log.error("Ошибка закрытия: %s — повтор", e)
-            # монеты со страницы: пауза только после стопа/пампа/тренда, иначе сразу снова в работу
-            hard = any(k in (grid.closing or "") for k in ("стоп", "памп", "тренд"))
-            if not web.CONTROL["symbols"] or hard:
-                cooldown[grid.sym] = time.time() + a.cooldown * 60
+            cooldown[grid.sym] = time.time() + a.cooldown * 60
             grid = None
     except KeyboardInterrupt:
         log.info("Остановка…")
