@@ -157,6 +157,45 @@ def klines(s, sym, n):
     return list(reversed(r["result"]["list"]))
 
 
+def scan_manual(s, inst, a, wanted):
+    """Монеты со страницы: торгуем их без фильтров сканера (решаешь ты). Несколько — сначала самая волатильная
+    за последнюю минуту в боковике. Защита внутри сетки (стоп, выход по пампу/тренду, дневной лимит) остаётся."""
+    bad = [x for x in wanted if x not in inst]
+    if bad and bad != getattr(scan_manual, "bad", None):          # пишем один раз, а не каждый скан
+        log.info("Таких фьючерсов на Bybit нет: %s", ", ".join(bad))
+        web.CONTROL["msg"] = "Нет на Bybit: " + ", ".join(bad)
+    scan_manual.bad = bad
+    res = []
+    for sym in [x for x in wanted if x in inst]:
+        try:
+            kl_all = klines(s, sym, max(a.window, a.range_window) + 1)
+            kl = kl_all[-(a.window + 1):]
+            m = analyze(kl, a)
+        except Exception as e:  # noqa: BLE001
+            log.info("%s: свечи не получил: %s", sym, str(e)[:100])
+            continue
+        if not m:
+            continue
+        m["symbol"] = sym
+        m["nn_base"] = nn.base_features(kl, m)
+        c = [float(k[4]) for k in kl_all]
+        path = sum(abs(c[i] - c[i - 1]) for i in range(1, len(c)))
+        m["er_long"] = abs(c[-1] - c[0]) / path if path > 0 else 1.0
+        m["move_long"] = (c[-1] / c[0] - 1) * 100
+        m["score"] = m["vol1m"] * (1 - m["er"]) * (1 - m["er_long"])
+        m["tier"], m["manual"] = 0, True
+        res.append(m)
+    res.sort(key=lambda r: r["score"], reverse=True)
+    res = apply_brain(res, a)
+    web.update(scan={"time": time.time(), "checked": len(wanted), "passed": len(res),
+                     "top": [{**{k: r[k] for k in ("symbol", "vol1m", "atr", "er", "score")},
+                              "pred": r["nn"]["pred"], "levels": r["grids"]} for r in res[:10]]})
+    for r in res[:5]:
+        log.info("  %-14s 1m=%.2f%% ATR=%.2f%% ER=%.2f ER%dм=%.2f (%+.1f%%) score=%.2f",
+                 r["symbol"], r["vol1m"], r["atr"], r["er"], a.range_window, r["er_long"], r["move_long"], r["score"])
+    return res
+
+
 def scan(s, inst, a):
     tick = api(s.get_tickers, category=CAT)["result"]["list"]
     syms = [t["symbol"] for t in tick
@@ -246,7 +285,11 @@ def apply_brain(res, a):
             continue
         cfg, levels, pred, feats = r["best"]
         dcfg, dlevels, dpred, dfeats = r["default"]
-        if use:
+        if use and c.get("manual") and not (pred is not None and pred > a.nn_min_edge):
+            # монету выбрал ты, а сеть ждёт минус — торгуем обычными настройками, не пропускаем
+            take = True
+            c["nn"] = {"pred": dpred, "feats": dfeats, "levels": dlevels, "cfg": None}
+        elif use:
             take = pred is not None and pred > a.nn_min_edge
             c["cfg"], c["grids"], c["size"] = cfg, levels, r["size"]
             c["nn"] = {"pred": pred, "feats": feats, "levels": levels, "cfg": cfg}
@@ -897,6 +940,9 @@ def main():
     p.add_argument("--chase-slip", type=int, default=5, help="быстрая лимитка: макс. тиков за лучшей ценой")
     p.add_argument("--close-timeout", type=float, default=120, help="сек на одну серию догона")
     p.add_argument("--cooldown", type=float, default=30, help="пауза для пары после закрытия, мин")
+    p.add_argument("--symbols", default="", help="монеты для торговли через запятую (страница главнее)")
+    p.add_argument("--auto-scan", action="store_true",
+                   help="если монеты не заданы — искать самому (по умолчанию бот ждёт, пока впишешь монету)")
     # сканер
     p.add_argument("--window", type=int, default=15, help="окно, 1m свечей")
     p.add_argument("--min-vol", type=float, default=10e6, help="мин. оборот 24ч, USDT")
@@ -1013,6 +1059,10 @@ def main():
         t.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
         return [x["symbol"] for x in t]
     day_load(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "day_pnl.json"))
+    web.load_symbols(os.path.join(os.path.dirname(os.path.abspath(a.nn_path)) or ".", "symbols.json"))
+    if a.symbols:                                   # монеты из BOT_ARGS — если на странице ещё ничего не задано
+        web.CONTROL["symbols"] = web.CONTROL["symbols"] or web.parse_symbols(a.symbols)
+    log.info("Монеты для торговли: %s", ", ".join(web.CONTROL["symbols"]) or "не заданы — впиши на странице")
     BRAIN = nn.Brain(a.nn_path, a, market, analyze, None, liquid)
     BRAIN.start()
     web.BRAIN = BRAIN
@@ -1033,9 +1083,14 @@ def main():
                 web.update(state=f"дневной лимит убытка: {DAY['pnl']:+.2f}$ за сутки UTC — жду следующих суток")
                 pause_wait(60)
                 continue
-            web.update(state="сканирую рынок", error="")
+            wanted = list(web.CONTROL["symbols"])
+            if not wanted and not a.auto_scan:
+                web.update(state="жду монету — впиши её на странице и нажми «Сохранить монеты»")
+                pause_wait(5)
+                continue
+            web.update(state=("проверяю монеты: " + ", ".join(wanted)) if wanted else "сканирую рынок", error="")
             try:
-                cands = scan(s, inst, a)
+                cands = scan_manual(s, inst, a, wanted) if wanted else scan(s, inst, a)
             except Exception as e:  # noqa: BLE001
                 log.error("Ошибка скана: %s", e)
                 web.update(error="Ошибка скана: %s" % e)
@@ -1067,6 +1122,11 @@ def main():
                 except ValueError as e:
                     log.info("%s", e)
             if not grid:
+                if wanted:
+                    log.info("Монеты со страницы сейчас взять нельзя (пауза после стопа или уже есть позиция), жду")
+                    web.update(state="монеты со страницы на паузе или заняты, жду")
+                    pause_wait(20)
+                    continue
                 log.info("Подходящих пар нет, жду 60 сек")
                 web.update(state="подходящих монет нет, жду")
                 pause_wait(60)
@@ -1084,6 +1144,8 @@ def main():
             while True:
                 time.sleep(a.poll)
                 reason = "стоп со страницы" if web.CONTROL["paused"] else grid.closing
+                if not reason and (web.CONTROL["symbols"] or not a.auto_scan) and grid.sym not in web.CONTROL["symbols"]:
+                    reason = "монету убрали со страницы"
                 if not reason:
                     try:
                         grid.sync()
@@ -1105,7 +1167,10 @@ def main():
                             break
                     except Exception as e:  # noqa: BLE001
                         log.error("Ошибка закрытия: %s — повтор", e)
-            cooldown[grid.sym] = time.time() + a.cooldown * 60
+            # монеты со страницы: пауза только после стопа/пампа/тренда, иначе сразу снова в работу
+            hard = any(k in (grid.closing or "") for k in ("стоп", "памп", "тренд"))
+            if not web.CONTROL["symbols"] or hard:
+                cooldown[grid.sym] = time.time() + a.cooldown * 60
             grid = None
     except KeyboardInterrupt:
         log.info("Остановка…")

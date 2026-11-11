@@ -7,6 +7,7 @@
 import collections
 import hmac
 import json
+import re
 import logging
 import os
 import threading
@@ -31,7 +32,32 @@ LOGS = collections.deque(maxlen=400)
 LOCK = threading.Lock()
 
 # Управление со страницы. paused=True: бот закрывает текущую сетку и не открывает новые.
-CONTROL = {"paused": os.getenv("START_PAUSED", "") == "1", "msg": ""}
+CONTROL = {"paused": os.getenv("START_PAUSED", "") == "1", "msg": "", "symbols": []}
+SYMBOLS_PATH = ""   # куда сохранять список монет со страницы (бот задаёт при старте: /data/symbols.json)
+
+
+def load_symbols(path):
+    global SYMBOLS_PATH
+    SYMBOLS_PATH = path
+    try:
+        with open(path, encoding="utf-8") as f:
+            CONTROL["symbols"] = [str(x) for x in json.load(f)]
+    except Exception:  # noqa: BLE001
+        CONTROL["symbols"] = []
+
+
+def parse_symbols(text):
+    """'jct, ARIA usdt  zec' -> ['JCTUSDT', 'ARIAUSDT', 'ZECUSDT']"""
+    out = []
+    for w in re.split(r"[\s,;]+", text.upper()):
+        w = re.sub(r"[^A-Z0-9]", "", w)
+        if not w or w == "USDT":
+            continue
+        if not w.endswith("USDT"):
+            w += "USDT"
+        if w not in out:
+            out.append(w)
+    return out[:20]
 CONTROL_KEY = os.getenv("CONTROL_KEY", "")
 BRAIN = None   # нейросеть бота (nn.Brain), задаёт bybit_grid_bot.main()
 
@@ -54,6 +80,7 @@ def snapshot():
         data = json.loads(json.dumps(STATUS, default=str))
     data["paused"] = CONTROL["paused"]
     data["control_msg"] = CONTROL["msg"]
+    data["symbols"] = list(CONTROL["symbols"])
     data["uptime_min"] = round((time.time() - STATUS["started"]) / 60, 1)
     data["logs"] = list(LOGS)[-200:]
     data["nn"] = BRAIN.status() if BRAIN else None
@@ -255,13 +282,18 @@ def render():
     key_input = ('<input name="key" type="password" placeholder="ключ управления" autocomplete="current-password">'
                  if CONTROL_KEY else "")
     msg = f'<span class="cmsg">{escape(s["control_msg"])}</span>' if s["control_msg"] else ""
+    syms = ", ".join(s.get("symbols") or [])
     controls = f"""
 <form class="ctrl" method="post">{key_input}
   <button formaction="/api/start" class="start" {'disabled' if not paused else ''}>Старт</button>
   <button formaction="/api/stop" class="stop" {'disabled' if paused else ''}>Стоп</button>
   <span class="cstate {'off' if paused else 'on'}">{'На паузе' if paused else 'Торгует'}</span>{msg}
+  <div class="syms"><input name="symbols" value="{escape(syms)}" placeholder="монеты: JCT, ARIA, ZEC" autocomplete="off">
+  <button formaction="/api/symbols" class="save">Сохранить монеты</button></div>
 </form>
-<p class="muted small">«Стоп» снимает ордера, закрывает позицию лимитками с догоном и ставит бота на паузу. «Старт» снова ищет монету и ставит сетку.</p>"""
+<p class="muted small">Бот торгует только монеты из этого поля (через запятую, USDT можно не писать). Несколько — берёт самую
+волатильную за последнюю минуту из них. Поле пустое — бот ждёт. Убрал монету, на которой стоит сетка, — сетка закрывается.
+«Стоп» снимает ордера, закрывает позицию лимитками с догоном и ставит бота на паузу.</p>"""
 
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -285,6 +317,8 @@ td:first-child,th:first-child{{text-align:left}}th{{font:600 11px system-ui;colo
 .ctrl input{{font:14px ui-monospace,monospace;padding:8px 10px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);min-width:0;width:180px}}
 .ctrl button{{font:700 14px system-ui;padding:9px 22px;border-radius:6px;border:0;cursor:pointer}}
 .ctrl button:disabled{{opacity:.35;cursor:default}}
+.syms{{display:flex;gap:8px;width:100%;margin-top:10px}}.syms input{{flex:1;min-width:0;width:auto;font:15px ui-monospace,monospace;text-transform:uppercase}}
+.ctrl button.save{{background:#3b82f6;color:#fff}}
 .start{{background:var(--acc);color:#06231a}}.stop{{background:var(--neg);color:#2a0705}}
 .cstate{{font-weight:700}}.cstate.on{{color:var(--pos)}}.cstate.off{{color:var(--warn)}}
 .cmsg{{color:var(--muted);font-size:13px}}
@@ -376,8 +410,7 @@ async function refresh() {{
   if (paused || document.hidden) return;
   const sel = window.getSelection && window.getSelection();
   if (sel && sel.toString()) return;
-  const k = keyIn();
-  if (k && document.activeElement === k) return;
+  if (document.activeElement && document.activeElement.tagName === 'INPUT') return;   // пока печатаешь — не обновляем
   let html;
   try {{ html = await (await fetch(location.pathname, {{ cache: 'no-store' }})).text(); }} catch (e) {{ return; }}
   const nxt = new DOMParser().parseFromString(html, 'text/html').querySelector('.wrap');
@@ -432,6 +465,16 @@ class Handler(BaseHTTPRequestHandler):
                 CONTROL["paused"] = True
                 CONTROL["msg"] = "Остановка: снимаю ордера и закрываю позицию…"
                 logging.getLogger("grid").info("СТОП со страницы")
+        elif self.path.startswith("/api/symbols"):
+            CONTROL["symbols"] = parse_symbols((form.get("symbols") or [""])[0])
+            CONTROL["msg"] = ("Монеты: " + ", ".join(CONTROL["symbols"])) if CONTROL["symbols"] else "Список монет пуст — бот ждёт"
+            logging.getLogger("grid").info("Монеты со страницы: %s", ", ".join(CONTROL["symbols"]) or "пусто")
+            if SYMBOLS_PATH:
+                try:
+                    with open(SYMBOLS_PATH, "w", encoding="utf-8") as f:
+                        json.dump(CONTROL["symbols"], f)
+                except Exception as e:  # noqa: BLE001
+                    logging.getLogger("grid").warning("Не сохранил список монет: %s", e)
         elif self.path.startswith("/api/start"):
             if CONTROL["paused"]:
                 CONTROL["paused"] = False
