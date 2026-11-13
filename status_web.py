@@ -31,7 +31,23 @@ LOGS = collections.deque(maxlen=400)
 LOCK = threading.Lock()
 
 # Управление со страницы. paused=True: бот закрывает текущую сетку и не открывает новые.
-CONTROL = {"paused": os.getenv("START_PAUSED", "") == "1", "msg": ""}
+CONTROL = {"paused": os.getenv("START_PAUSED", "") == "1", "msg": "", "symbol": ""}
+SYMBOL_FILE = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"), "manual_symbol.txt")
+try:
+    with open(SYMBOL_FILE, encoding="utf-8") as _f:
+        CONTROL["symbol"] = _f.read().strip().upper()
+except OSError:
+    pass
+
+
+def set_symbol(sym):
+    """Монета, выбранная на странице ('' = сканер сам выбирает). Сохраняется на диск."""
+    CONTROL["symbol"] = sym
+    try:
+        with open(SYMBOL_FILE, "w", encoding="utf-8") as f:
+            f.write(sym)
+    except OSError:
+        pass
 CONTROL_KEY = os.getenv("CONTROL_KEY", "")
 BRAIN = None   # нейросеть бота (nn.Brain), задаёт bybit_grid_bot.main()
 
@@ -54,6 +70,7 @@ def snapshot():
         data = json.loads(json.dumps(STATUS, default=str))
     data["paused"] = CONTROL["paused"]
     data["control_msg"] = CONTROL["msg"]
+    data["manual_symbol"] = CONTROL["symbol"]
     data["uptime_min"] = round((time.time() - STATUS["started"]) / 60, 1)
     data["logs"] = list(LOGS)[-200:]
     data["nn"] = BRAIN.status() if BRAIN else None
@@ -261,7 +278,14 @@ def render():
   <button formaction="/api/stop" class="stop" {'disabled' if paused else ''}>Стоп</button>
   <span class="cstate {'off' if paused else 'on'}">{'На паузе' if paused else 'Торгует'}</span>{msg}
 </form>
-<p class="muted small">«Стоп» снимает ордера, закрывает позицию лимитками с догоном и ставит бота на паузу. «Старт» снова ищет монету и ставит сетку.</p>"""
+<form class="ctrl" method="post" style="margin-top:10px">{'<input type="hidden" name="key">' if CONTROL_KEY else ''}
+  <input name="symbol" placeholder="монета, напр. AKE" value="{escape(s.get('manual_symbol') or '')}" autocomplete="off">
+  <button formaction="/api/symbol" class="start">Торговать её</button>
+  <button formaction="/api/symbol?auto=1" class="stop">Сканер</button>
+  <span class="cstate on">{('Монета: ' + escape(s['manual_symbol'])) if s.get('manual_symbol') else 'Монету выбирает сканер'}</span>
+</form>
+<p class="muted small">«Стоп» снимает ордера, закрывает позицию лимитками с догоном и ставит бота на паузу. «Старт» снова ищет монету и ставит сетку.
+Впиши монету и нажми «Торговать её» — бот закроет текущую сетку и будет ставить сетки только на неё (фильтры сканера не применяются). «Сканер» — снова выбирать самую волатильную самому.</p>"""
 
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -333,10 +357,12 @@ pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mo
 // Обновление без перезагрузки: раз в 5 сек подменяем содержимое на месте и оставляем на экране то,
 // что сейчас читаешь (прокрутка страницы, лога и мыслей не прыгает). Пока выделен текст — не обновляем.
 let paused = false;
-const keyIn = () => document.querySelector('input[name=key]');
+const keyIn = () => document.querySelector('input[name=key]:not([type=hidden])');
+const symIn = () => document.querySelector('input[name=symbol]');
 try {{ const k = keyIn(); if (k) k.value = localStorage.getItem('ctrlKey') || ''; }} catch (e) {{}}
 document.addEventListener('submit', e => {{
   const k = keyIn();
+  if (k) document.querySelectorAll('input[name=key][type=hidden]').forEach(h => {{ h.value = k.value; }});
   try {{ if (k) localStorage.setItem('ctrlKey', k.value); }} catch (er) {{}}
 }});
 function paintBtn() {{
@@ -377,7 +403,7 @@ async function refresh() {{
   const sel = window.getSelection && window.getSelection();
   if (sel && sel.toString()) return;
   const k = keyIn();
-  if (k && document.activeElement === k) return;
+  if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
   let html;
   try {{ html = await (await fetch(location.pathname, {{ cache: 'no-store' }})).text(); }} catch (e) {{ return; }}
   const nxt = new DOMParser().parseFromString(html, 'text/html').querySelector('.wrap');
@@ -390,9 +416,12 @@ async function refresh() {{
   const ap = panels.find(p => p.getBoundingClientRect().bottom > 0);
   const aKey = ap ? pkey(ap) : null, aTop = ap ? ap.getBoundingClientRect().top : 0, aIdx = panels.indexOf(ap);
   const keyVal = k ? k.value : '';
+  const si = symIn(), symVal = si ? si.value : null, symDirty = si && si.value !== si.defaultValue;
   cur.innerHTML = nxt.innerHTML;
   const k2 = keyIn();
   if (k2) k2.value = keyVal;
+  const si2 = symIn();
+  if (si2 && symDirty) si2.value = symVal;
   [...cur.querySelectorAll(SCROLLS)].forEach((el, i) => {{ if (old[i]) restore(el, old[i]); }});
   if (ap) {{
     const np = [...cur.children].find(p => pkey(p) === aKey) || cur.children[aIdx];
@@ -432,6 +461,15 @@ class Handler(BaseHTTPRequestHandler):
                 CONTROL["paused"] = True
                 CONTROL["msg"] = "Остановка: снимаю ордера и закрываю позицию…"
                 logging.getLogger("grid").info("СТОП со страницы")
+        elif self.path.startswith("/api/symbol"):
+            raw = "" if "auto=1" in self.path else (form.get("symbol") or [""])[0]
+            sym = "".join(ch for ch in raw.upper() if ch.isalnum())
+            if sym and not sym.endswith("USDT"):
+                sym += "USDT"
+            if sym != CONTROL["symbol"]:
+                set_symbol(sym)
+                CONTROL["msg"] = f"Монета: {sym}" if sym else "Монету снова выбирает сканер"
+                logging.getLogger("grid").info("Монета со страницы: %s", sym or "сканер")
         elif self.path.startswith("/api/start"):
             if CONTROL["paused"]:
                 CONTROL["paused"] = False

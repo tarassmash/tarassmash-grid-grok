@@ -921,9 +921,22 @@ def main():
                     web.CONTROL["msg"] = "Бот на паузе, ордера сняты, позиция закрыта"
                 time.sleep(1)
                 continue
-            web.update(state="сканирую рынок", error="")
+            manual = web.CONTROL["symbol"]
+            if manual and manual not in inst:
+                log.error("Монеты %s нет среди USDT-фьючерсов Bybit — возвращаю сканер", manual)
+                web.set_symbol("")
+                web.CONTROL["msg"] = f"Монеты {manual} нет на Bybit (USDT-перп)"
+                manual = ""
+            web.update(state=("ставлю сетку на " + manual) if manual else "сканирую рынок", error="")
             try:
-                cands = scan(s, inst, a)
+                if manual:
+                    m = analyze(klines(s, manual, a.window + 1), a)
+                    if not m:
+                        raise RuntimeError(f"нет свечей по {manual}")
+                    m["symbol"] = manual
+                    cands = [m]
+                else:
+                    cands = scan(s, inst, a)
             except Exception as e:  # noqa: BLE001
                 log.error("Ошибка скана: %s", e)
                 web.update(error="Ошибка скана: %s" % e)
@@ -932,7 +945,8 @@ def main():
             if web.CONTROL["paused"]:
                 continue
             now = time.time()
-            cands = [c for c in cands if cooldown.get(c["symbol"], 0) < now]
+            if not manual:
+                cands = [c for c in cands if cooldown.get(c["symbol"], 0) < now]
             grid = None
             for c in cands:
                 try:
@@ -972,6 +986,9 @@ def main():
             while True:
                 time.sleep(a.poll)
                 reason = "стоп со страницы" if web.CONTROL["paused"] else grid.closing
+                ms = web.CONTROL["symbol"]
+                if not reason and ms and ms != grid.sym:
+                    reason = f"выбрана монета {ms}"
                 if not reason:
                     try:
                         grid.sync()
