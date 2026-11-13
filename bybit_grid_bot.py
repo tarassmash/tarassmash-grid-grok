@@ -176,7 +176,8 @@ def scan(s, inst, a):
     relax = bool(BRAIN and a.nn and BRAIN.active)
     max_er = a.nn_scan_max_er if relax else a.max_er
     min_1m = a.min_1m * a.nn_scan_relax if relax else a.min_1m
-    res = [r for r in res if r["er"] <= max_er and r["turnover"] >= a.min_vol_win and r["vol1m"] >= min_1m]
+    res = [r for r in res if r["er"] <= max_er and r["turnover"] >= a.min_vol_win and r["vol1m"] >= min_1m
+           and r["atr"] >= a.min_atr]
     res.sort(key=lambda r: r["score"], reverse=True)
     res = apply_brain(res, a)
     log.info("Скан: %d пар по объёму, %d прошли фильтры", len(syms), len(res))
@@ -820,6 +821,7 @@ def main():
     p.add_argument("--min-vol-win", type=float, default=300e3, help="мин. оборот за окно, USDT")
     p.add_argument("--min-1m", type=float, default=0.5, help="мин. размах за минуту, %%")
     p.add_argument("--max-er", type=float, default=0.5)
+    p.add_argument("--min-atr", type=float, default=0, help="мин. средний размах 1m свечи за окно, %% (0 = выкл)")
     p.add_argument("--fee", type=float, default=0.055, help="комиссия, %% (taker Bybit 0.055)")
     p.add_argument("--pad", type=float, default=0.3, help="запас к границам, %%")
     p.add_argument("--keep-on-exit", action="store_true", help="Ctrl+C не закрывает сетку")
