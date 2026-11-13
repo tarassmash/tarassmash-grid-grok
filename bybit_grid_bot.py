@@ -352,7 +352,7 @@ class Grid:
         cfg = cand.get("cfg") or {}
         self.cfg = cfg
         self.geo = bool(cfg.get("geo", 0))                 # геометрическая: равный шаг в %
-        self.lotk = float(cfg.get("lotk", 1.0))            # рост лота на каждый уровень от цены
+        self.lotk = float(cfg.get("lotk", a.lotk))         # рост лота на каждый уровень от цены
         self.shift_steps = float(cfg.get("shift", a.shift_steps))
         self.hold = float(cfg.get("hold", a.max_minutes))
         self.budget = a.budget * float(cand.get("size", 1.0))
@@ -371,9 +371,15 @@ class Grid:
         # объём всей сетки = маржа × плечо; максимум позиции в одну сторону — столько же
         self.total = D(self.budget) * D(self.lev) / price
         self.qty = round_step(self.total / D(self.n), ins["qty_step"])     # средний лот (для показа)
-        wts = [self.lotk ** abs(i - self.n // 2) for i in range(self.n + 1) if i != self.n // 2]
-        q_min = round_step(self.total * D(min(wts) / sum(wts)), ins["qty_step"])
-        if q_min < ins["min_qty"] or q_min * price < ins["min_notional"]:
+        def qmin(n, k):
+            w = [k ** abs(i - n // 2) for i in range(n + 1) if i != n // 2]
+            return round_step(self.total * D(min(w) / sum(w)), ins["qty_step"])
+        small = lambda q: q < ins["min_qty"] or q * price < ins["min_notional"]  # noqa: E731
+        # лоты растут от цены (--lotk): если ближний лот выходит меньше минимума биржи — меньше уровней
+        while self.lotk > 1 and small(qmin(self.n, self.lotk)) and self.n > 6:
+            self.n -= 1
+        q_min = qmin(self.n, self.lotk)
+        if small(q_min):
             raise ValueError(f"{self.sym}: маржи мало для {self.n} уровней "
                              f"(лот {q_min} < min {ins['min_qty']} или < {ins['min_notional']}$)")
         self.max_pos = float(self.total)
@@ -398,6 +404,7 @@ class Grid:
         self.nn_checked = time.time()
         self.nn_bad = 0                 # сколько минут подряд сеть ждёт минус дальше
         self.nn_live = None             # последняя переоценка сетки нейросетью
+        self.resets = 0                 # сколько раз позиция закрыта в плюс на откате
 
     # --- уровни
     def set_levels(self, lo, hi):
@@ -642,6 +649,35 @@ class Grid:
         log.info("%s: поставлено %d ордеров", self.sym, len(self.live))
         self.publish()
 
+    def pos_take(self, price):
+        """Откат после набора позиции: если вся позиция уже в плюсе на --pos-tp %%, закрываем её
+        мейкер-лимитками и ставим сетку заново вокруг цены (сетка продолжает работать)."""
+        a = self.a
+        if a.pos_tp <= 0 or self.closing:
+            return
+        held = self.long + self.short
+        lvl = float(self.total) / max(self.n, 1)
+        if held < a.pos_tp_levels * lvl:
+            return
+        upnl = (price - self.lavg) * self.long + (self.savg - price) * self.short
+        avg = (self.lavg * self.long + self.savg * self.short) / held
+        if upnl < held * avg * a.pos_tp / 100:
+            return
+        log.info("%s: ОТКАТ — позиция %g в плюсе %+.3f$ (≥ %g%%), фиксирую и ставлю сетку заново",
+                 self.sym, held, upnl, a.pos_tp)
+        self.cancel_grid()
+        if not a.dry and not chase_flat(self.s, self.sym, self.ins, a, a.close_timeout):
+            log.warning("%s: позиция закрылась не до конца — продолжаю сеткой", self.sym)
+        legs = positions(self.s, self.sym) if not a.dry else []
+        self.book("Sell" if self.long else "Buy", 1 if self.long and self.hedge else (2 if self.hedge else 0),
+                  price, held - sum(float(q) for _sd, q, _i in legs))
+        half = (self.upper - self.lower) / 2
+        self.set_levels(price - half, price + half)
+        self.layout(price)
+        self.resets += 1
+        log.info("%s: сетка заново: %s … %s, PnL сетки≈%.3f$", self.sym, self.lower, self.upper, self.pnl())
+        self.refill()
+
     def check_exit(self, price):
         if (time.time() - self.t0) / 60 >= self.hold:
             return "истекло время"
@@ -760,6 +796,12 @@ def main():
     p.add_argument("--max-levels", type=int, default=20, help="макс. уровней сетки (≤40)")
     p.add_argument("--max-loss", type=float, default=30, help="стоп: убыток в %% от маржи (0 = выкл)")
     p.add_argument("--tp-usdt", type=float, default=0, help="закрыть при прибыли ≥ X$ (0 = выкл)")
+    p.add_argument("--lotk", type=float, default=1.15,
+                   help="лот растёт в X раз на каждый уровень от цены: дальние покупки/продажи крупнее (1 = равные)")
+    p.add_argument("--pos-tp", type=float, default=0.4,
+                   help="откат: закрыть набранную позицию, когда она в плюсе на X%% от объёма (0 = выкл)")
+    p.add_argument("--pos-tp-levels", type=float, default=2,
+                   help="…если позиция не меньше N уровней (меньшую закрывают обычные встречные ордера)")
     p.add_argument("--max-minutes", type=float, default=60, help="макс. жизнь сетки, мин")
     p.add_argument("--exit-er", type=float, default=0, help="закрыть, если ER выше (тренд); 0 = выкл")
     p.add_argument("--poll", type=float, default=1, help="опрос ордеров, сек")
@@ -933,6 +975,7 @@ def main():
                         grid.sync()
                         price = grid.last_price()
                         grid.follow(price)
+                        grid.pos_take(price)
                         reason = grid.check_exit(price)
                         if not reason and BRAIN and time.time() - grid.nn_checked >= 60:
                             grid.nn_checked = time.time()
