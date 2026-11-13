@@ -724,42 +724,81 @@ class Grid:
 
 # ---------------------------------------------------------------- езда за пампом
 
+def maker_px(s, sym, side, tick):
+    """Цена мейкер-лимитки у лучшей цены своей стороны (не пересекает спред)."""
+    ob = api(s.get_orderbook, category=CAT, symbol=sym, limit=1)["result"]
+    bid, ask = D(ob["b"][0][0]), D(ob["a"][0][0])
+    if side == "Buy":
+        return bid + tick if bid + tick < ask else bid
+    return ask - tick if ask - tick > bid else ask
+
+
 def ride(s, a, sym, ins, direction, notional):
-    """Памп/дамп: входим ПО движению небольшим объёмом и держим, пока цена не откатит
-    на --ride-trail %% от лучшей (трейлинг-стоп), или до --ride-max-min минут."""
+    """Памп/дамп: входим ПО движению — только мейкер-лимитками (PostOnly, без маркета и без IOC).
+    Лимитка стоит у лучшей цены и переставляется каждые --ride-repost сек, пока не наберём объём,
+    не выйдет --ride-entry-sec или цена не убежит на --ride-max-chase %% (тогда пропускаем — не догоняем).
+    Выход: трейлинг-стоп шириной max(--ride-trail %%, --ride-atr-k × ATR 1m), после +1 ширины —
+    стоп не хуже безубытка. Закрытие тоже мейкер-лимитками; IOC — только аварийно (--ride-exit-sec)."""
     side = "Buy" if direction > 0 else "Sell"
     tick = ins["tick"]
-    t = api(s.get_tickers, category=CAT, symbol=sym)["result"]["list"][0]
-    price = D(t["lastPrice"])
-    qty = round_step(D(notional) / price, ins["qty_step"])
-    if qty < ins["min_qty"] or qty * price < ins["min_notional"]:
-        log.info("%s: езда за пампом — объём %s меньше минимума биржи, пропускаю", sym, qty)
+    kl = klines(s, sym, 15)
+    m = analyze(kl, a) if kl else None
+    atr = m["atr"] if m else 0.0
+    width = max(a.ride_trail, a.ride_atr_k * atr) / 100          # ширина трейлинга
+    p0 = float(api(s.get_tickers, category=CAT, symbol=sym)["result"]["list"][0]["lastPrice"])
+    qty = round_step(D(notional) / D(p0), ins["qty_step"])
+    if qty < ins["min_qty"] or qty * D(p0) < ins["min_notional"]:
+        log.info("%s: езда — объём %s меньше минимума биржи, пропускаю", sym, qty)
         return
     idx = (1 if side == "Buy" else 2) if is_hedge(s, sym) else 0
-    log.info("%s: ЕДУ ЗА %s — %s %s (≈%.1f$), трейлинг %g%%", sym, "ПАМПОМ" if direction > 0 else "ДАМПОМ",
-             side, qty, float(qty * price), a.ride_trail)
+    log.info("%s: ЕДУ ЗА %s — %s %s (≈%.1f$) мейкер-лимитками, трейлинг %.2f%% (ATR %.2f%%)", sym,
+             "ПАМПОМ" if direction > 0 else "ДАМПОМ", side, qty, float(qty) * p0, width * 100, atr)
     web.update(state=f"еду за {'пампом' if direction > 0 else 'дампом'}: {sym}")
-    for _ in range(3):                                   # вход: быстрая лимитка через спред (IOC)
-        if position(s, sym)[1] >= qty:
+
+    # --- вход: только PostOnly
+    t_end, oid = time.time() + a.ride_entry_sec, None
+    while time.time() < t_end:
+        have = position(s, sym)[1]
+        if have >= qty:
             break
-        ob = api(s.get_orderbook, category=CAT, symbol=sym, limit=1)["result"]
-        bid, ask = D(ob["b"][0][0]), D(ob["a"][0][0])
-        px = ask + tick * a.chase_slip if side == "Buy" else bid - tick * a.chase_slip
-        left = qty - position(s, sym)[1]
+        if oid:
+            try:
+                s.cancel_order(category=CAT, symbol=sym, orderId=oid)
+            except Exception:  # noqa: BLE001
+                pass
+            oid = None
+            have = position(s, sym)[1]
+            if have >= qty:
+                break
+        px = maker_px(s, sym, side, tick)
+        if (float(px) - p0) / p0 * 100 * direction > a.ride_max_chase:
+            log.info("%s: цена убежала на >%g%% от сигнала — не догоняю", sym, a.ride_max_chase)
+            break
+        left = round_step(qty - have, ins["qty_step"])
+        if left < ins["min_qty"]:
+            break
         try:
-            api(s.place_order, category=CAT, symbol=sym, side=side, orderType="Limit", qty=str(left),
-                price=str(px), timeInForce="IOC", positionIdx=idx)
+            r = api(s.place_order, category=CAT, symbol=sym, side=side, orderType="Limit", qty=str(left),
+                    price=str(px), timeInForce="PostOnly", positionIdx=idx)
+            oid = r["result"]["orderId"]
         except Exception as e:  # noqa: BLE001
-            log.warning("%s: вход не встал: %s", sym, str(e)[:120])
-        time.sleep(0.4)
+            log.warning("%s: лимитка входа не встала: %s", sym, str(e)[:120])
+        time.sleep(a.ride_repost)
+    if oid:
+        try:
+            s.cancel_order(category=CAT, symbol=sym, orderId=oid)
+        except Exception:  # noqa: BLE001
+            pass
     r = api(s.get_positions, category=CAT, symbol=sym)["result"]["list"]
     leg = next((p for p in r if D(p.get("size") or 0) > 0), None)
     if not leg:
-        log.info("%s: вход не исполнился — цена убежала, пропускаю", sym)
+        log.info("%s: мейкер-вход не исполнился — пропускаю (без маркета)", sym)
         return
     entry, size = float(leg["avgPrice"]), float(leg["size"])
-    best, t0, reason = entry, time.time(), ""
-    trail = a.ride_trail / 100
+    log.info("%s: вошёл %s %g @ %g мейкером", sym, side, size, entry)
+
+    # --- сопровождение
+    best, t0, reason, px = entry, time.time(), "", entry
     while True:
         time.sleep(a.poll)
         try:
@@ -768,23 +807,30 @@ def ride(s, a, sym, ins, direction, notional):
             log.error("%s: цена: %s", sym, e)
             continue
         best = max(best, px) if direction > 0 else min(best, px)
-        back = (best - px) / best if direction > 0 else (px - best) / best
+        stop = best * (1 - width) if direction > 0 else best * (1 + width)
+        run = (best - entry) / entry * direction
+        if run >= width:                                   # ушли на ширину в плюс — стоп не хуже безубытка
+            be = entry * (1 + a.fee * 2 / 100 * direction)
+            stop = max(stop, be) if direction > 0 else min(stop, be)
         gain = (px - entry) / entry * 100 * direction
-        web.update(grid={"symbol": sym, "lower": entry, "upper": best, "levels": 0, "step_pct": 0, "qty": str(size),
-                         "open_orders": 0, "fills": 1, "profit": (px - entry) * size * direction, "net": size * direction,
-                         "shifts": 0, "started": t0, "closing": f"езда за {'пампом' if direction > 0 else 'дампом'}",
+        web.update(grid={"symbol": sym, "lower": entry, "upper": best, "levels": 0, "step_pct": width * 100,
+                         "qty": str(size), "open_orders": 0, "fills": 1, "profit": (px - entry) * size * direction,
+                         "net": size * direction, "shifts": 0, "started": t0,
+                         "closing": f"езда за {'пампом' if direction > 0 else 'дампом'}, стоп {stop:g}",
                          "budget": 0, "cfg": "", "nn_live": None})
         if web.CONTROL["paused"]:
             reason = "стоп со страницы"
-        elif back >= trail:
-            reason = f"откат {back * 100:.2f}% от лучшей {best:g}"
+        elif (direction > 0 and px <= stop) or (direction < 0 and px >= stop):
+            reason = f"трейлинг-стоп {stop:g} (лучшая {best:g})"
         elif (time.time() - t0) / 60 >= a.ride_max_min:
             reason = "истекло время езды"
         if reason:
             break
     log.info("%s: выхожу из езды — %s (сейчас %+.2f%% от входа)", sym, reason, gain)
-    ok = chase_flat(s, sym, ins, a, a.close_timeout)
-    pnl = (px - entry) * size * direction - a.fee / 100 * (entry + px) * size
+    # выход мейкер-лимитками; IOC через спред — только если за --ride-exit-sec не вышли
+    ea = argparse.Namespace(**{**vars(a), "chase_tries": max(a.chase_tries, int(a.ride_exit_sec / max(a.chase_sec, 0.5)))})
+    ok = chase_flat(s, sym, ins, ea, a.ride_exit_sec + a.close_timeout)
+    pnl = (px - entry) * size * direction - a.maker_fee / 100 * (entry + px) * size
     log.info("%s: езда закрыта%s. Вход %g → выход ~%g, PnL≈%.3f$", sym, "" if ok else " НЕ ДО КОНЦА", entry, px, pnl)
     with web.LOCK:
         web.STATUS["history"].append({"time": time.strftime("%d.%m %H:%M UTC", time.gmtime()), "symbol": sym + " (памп)",
@@ -873,8 +919,14 @@ def main():
     p.add_argument("--max-against-levels", type=float, default=2,
                    help="позиция против движения — не больше N уровней сетки (0 = вся сетка)")
     p.add_argument("--ride-frac", type=float, default=0.5, help="езда за пампом: объём = X × объём сетки (0 = выкл)")
-    p.add_argument("--ride-trail", type=float, default=1.0, help="езда: выход при откате X%% от лучшей цены")
+    p.add_argument("--ride-trail", type=float, default=1.0, help="езда: минимальная ширина трейлинга, %%")
+    p.add_argument("--ride-atr-k", type=float, default=1.5, help="езда: ширина трейлинга = K × ATR 1m (если больше --ride-trail)")
     p.add_argument("--ride-max-min", type=float, default=30, help="езда: не дольше N минут")
+    p.add_argument("--ride-entry-sec", type=float, default=20, help="езда: сколько сек ловить вход мейкер-лимиткой")
+    p.add_argument("--ride-repost", type=float, default=0.7, help="езда: переставлять лимитку входа каждые N сек")
+    p.add_argument("--ride-max-chase", type=float, default=0.8, help="езда: не догонять, если цена ушла дальше X%% от сигнала")
+    p.add_argument("--ride-exit-sec", type=float, default=30, help="езда: сколько сек выходить мейкером до аварийной IOC")
+    p.add_argument("--maker-fee", type=float, default=0.02, help="комиссия мейкера, %% (Bybit 0.02)")
     p.add_argument("--exit-er", type=float, default=0, help="закрыть, если ER выше (тренд); 0 = выкл")
     p.add_argument("--poll", type=float, default=1, help="опрос ордеров, сек")
     # сетка идёт за ценой
@@ -1065,7 +1117,7 @@ def main():
                         log.error("Ошибка закрытия: %s — повтор", e)
             if grid.pump_dir and a.ride_frac > 0 and not web.CONTROL["paused"]:
                 try:
-                    ride(s, a, grid.sym, grid.ins, grid.pump_dir, grid.notional * a.ride_frac)
+                    ride(s, a, grid.sym, grid.ins, grid.pump_dir, a.budget * grid.lev * a.ride_frac)
                 except Exception as e:  # noqa: BLE001
                     log.error("%s: езда за пампом: %s — закрываю", grid.sym, e)
                     try:
