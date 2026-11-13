@@ -41,6 +41,7 @@ import shlex
 import signal
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
@@ -398,6 +399,8 @@ class Grid:
         self.nn_checked = time.time()
         self.nn_bad = 0                 # сколько минут подряд сеть ждёт минус дальше
         self.nn_live = None             # последняя переоценка сетки нейросетью
+        self.peak = 0.0                 # лучший PnL сетки — от него защита прибыли
+        self.ph = deque()               # (время, цена) за последние --pump-min минут
 
     # --- уровни
     def set_levels(self, lo, hi):
@@ -650,6 +653,29 @@ class Grid:
             return f"тейк-профит {pnl:.2f}$"
         if self.stop_usdt and pnl <= -self.stop_usdt:
             return f"стоп по убытку {pnl:.2f}$"
+        a = self.a
+        # жёсткий потолок убытка одной сетки в $
+        if a.stop_cap_usdt > 0 and pnl <= -a.stop_cap_usdt:
+            return f"потолок убытка {pnl:.2f}$ (≤ -{a.stop_cap_usdt:g}$)"
+        # защита прибыли: сетка была в плюсе — не отдаём больше половины (--trail-keep) обратно
+        self.peak = max(self.peak, pnl)
+        if a.trail_start > 0 and self.peak >= a.trail_start and pnl <= self.peak * a.trail_keep / 100:
+            return f"защита прибыли: пик {self.peak:+.2f}$ → сейчас {pnl:+.2f}$"
+        # памп/дамп против позиции: цена резко ушла, а сетка набрала позицию против движения
+        now = time.time()
+        self.ph.append((now, price))
+        while self.ph and now - self.ph[0][0] > a.pump_min * 60:
+            self.ph.popleft()
+        if a.pump_pct > 0 and len(self.ph) > 1 and now - self.ph[0][0] >= a.pump_min * 30:
+            p0 = self.ph[0][1]
+            move = (price - p0) / p0 * 100 if p0 else 0.0
+            short = self.short if self.hedge else max(0.0, -self.net)
+            long_ = self.long if self.hedge else max(0.0, self.net)
+            big = a.pump_pos / 100 * self.max_pos
+            if move >= a.pump_pct and short >= big:
+                return f"памп +{move:.2f}% за {a.pump_min:g} мин против шорта (PnL {pnl:+.2f}$)"
+            if move <= -a.pump_pct and long_ >= big:
+                return f"дамп {move:.2f}% за {a.pump_min:g} мин против лонга (PnL {pnl:+.2f}$)"
         if self.a.exit_er > 0 and time.time() - self.er_checked > 30:
             self.er_checked = time.time()
             m = analyze(klines(self.s, self.sym, self.a.window + 1), self.a)
@@ -761,6 +787,12 @@ def main():
     p.add_argument("--max-loss", type=float, default=30, help="стоп: убыток в %% от маржи (0 = выкл)")
     p.add_argument("--tp-usdt", type=float, default=0, help="закрыть при прибыли ≥ X$ (0 = выкл)")
     p.add_argument("--max-minutes", type=float, default=60, help="макс. жизнь сетки, мин")
+    p.add_argument("--stop-cap-usdt", type=float, default=2.0, help="закрыть сетку при убытке ≥ X$ (0 = выкл)")
+    p.add_argument("--trail-start", type=float, default=0.5, help="защита прибыли включается, когда PnL сетки ≥ X$ (0 = выкл)")
+    p.add_argument("--trail-keep", type=float, default=50, help="…и закрывает, если PnL упал ниже X%% от пика")
+    p.add_argument("--pump-pct", type=float, default=2.0, help="памп/дамп: цена ушла на X%% … (0 = выкл)")
+    p.add_argument("--pump-min", type=float, default=5, help="…за N минут…")
+    p.add_argument("--pump-pos", type=float, default=40, help="…а позиция против движения ≥ X%% от максимума — закрыть")
     p.add_argument("--exit-er", type=float, default=0, help="закрыть, если ER выше (тренд); 0 = выкл")
     p.add_argument("--poll", type=float, default=1, help="опрос ордеров, сек")
     # сетка идёт за ценой
