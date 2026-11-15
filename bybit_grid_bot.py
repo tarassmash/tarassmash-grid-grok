@@ -772,6 +772,23 @@ def balance(s):
     return bal
 
 
+def entry_max_vol(a):
+    return a.nn_regime_vol if a.entry_max_vol is None else a.entry_max_vol
+
+
+def market_too_hot(a):
+    """Волатильность рынка (медиана по монетам, 15 мин к прошлому часу), если она выше порога, иначе 0.
+    Режим считает нейросеть раз в минуту; устаревшему (старше 5 мин) или ещё не посчитанному не верим."""
+    lim = entry_max_vol(a)
+    if lim <= 0 or BRAIN is None:
+        return 0
+    r, t = getattr(BRAIN, "regime", None), getattr(BRAIN, "regime_t", 0)
+    if not r or time.time() * 1000 - t > 5 * 60_000:
+        return 0
+    vr = r.get("vol_ratio") or 0
+    return vr if vr >= lim else 0
+
+
 def pause_wait(sec):
     """Ждать sec секунд, но выйти сразу, если нажали «Стоп»."""
     end = time.time() + sec
@@ -848,6 +865,9 @@ def main():
     p.add_argument("--nn-exit-min-age", type=float, default=5, help="…и сетка живёт не меньше N минут")
     p.add_argument("--nn-regime-vol", type=float, default=1.7,
                    help="смена рынка: волатильность за 15 мин к прошлому часу больше ×X (или меньше 1/X)")
+    p.add_argument("--entry-max-vol", type=float, default=None,
+                   help="не открывать новую сетку, пока волатильность рынка (15 мин к часу) ≥ ×X; "
+                        "по умолчанию = --nn-regime-vol, 0 — выключить")
     p.add_argument("--nn-regime-er", type=float, default=0.3, help="смена рынка: трендовость за 30 мин изменилась на X")
     p.add_argument("--nn-regime-confirm", type=int, default=3, help="сигнал смены рынка должен держаться N минут")
     p.add_argument("--nn-regime-min-n", type=int, default=20, help="итогов в новом режиме, чтобы сеть снова решала")
@@ -913,6 +933,7 @@ def main():
 
     cooldown = {}
     grid = None
+    hot_logged = False
     try:
         while True:
             if web.CONTROL["paused"]:
@@ -927,6 +948,19 @@ def main():
                 web.set_symbol("")
                 web.CONTROL["msg"] = f"Монеты {manual} нет на Bybit (USDT-перп)"
                 manual = ""
+            if not manual:
+                hot = market_too_hot(a)
+                if hot:
+                    if not hot_logged:
+                        log.info("Рынок горячий: волатильность ×%.2f ≥ ×%.2f — новую сетку не открываю, жду",
+                                 hot, entry_max_vol(a))
+                        hot_logged = True
+                    web.update(state="рынок горячий (волат. ×%.2f) — жду, сетку не открываю" % hot)
+                    pause_wait(60)
+                    continue
+                if hot_logged:
+                    log.info("Рынок успокоился — снова ищу монету")
+                    hot_logged = False
             web.update(state=("ставлю сетку на " + manual) if manual else "сканирую рынок", error="")
             try:
                 if manual:

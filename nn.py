@@ -785,6 +785,7 @@ class Brain:
         a = self.a
         r = self.market_regime(syms)
         self.regime = r
+        self.regime_t = now             # когда посчитан режим (мс) — бот не верит устаревшему
         if self.regime_hold:
             n_post = sum(1 for e in self.evals if e["t"] >= self.regime_start and "net" in e)
             if n_post >= a.nn_regime_min_n or now - self.regime_start >= a.nn_regime_max * 60_000:
