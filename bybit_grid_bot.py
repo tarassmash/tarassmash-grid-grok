@@ -200,6 +200,7 @@ def apply_brain(res, a):
     out, decided = [], []
     BRAIN.focus = [c["symbol"] for c in res]      # монеты сканера — учится на них в первую очередь
     use = a.nn and BRAIN.active
+    only_ai = getattr(a, "ai", False)
     for c in res:
         r = BRAIN.evaluate(c)
         if not r:
@@ -212,7 +213,7 @@ def apply_brain(res, a):
             c["nn"] = {"pred": pred, "feats": feats, "levels": levels, "cfg": cfg}
             c["nn_fallback"] = {"pred": dpred, "feats": dfeats, "levels": dlevels, "cfg": dcfg}
         else:
-            take = True
+            take = not only_ai          # «только AI»: пока сеть не решает — сеток нет
             c["nn"] = {"pred": dpred, "feats": dfeats, "levels": dlevels, "cfg": None}
         decided.append({"symbol": c["symbol"], "pred": pred, "pred_default": dpred if dpred is not None else 0.0,
                         "levels": levels, "cfg": cfg, "feats": feats, "take": take, "size": r["size"]})
@@ -905,7 +906,8 @@ def main():
     # нейросеть
     p.add_argument("--no-nn", dest="nn", action="store_false", help="не давать нейросети принимать решения (учится всё равно)")
     p.add_argument("--ai", action="store_true", default=os.getenv("AI_CONTROL", "") == "1",
-                   help="полное управление нейросетью (перекрывает --no-nn); то же — переменная AI_CONTROL=1")
+                   help="только нейросеть: сетки открывает только она, без обычных настроек (перекрывает --no-nn); "
+                        "то же — переменная AI_CONTROL=1")
     p.add_argument("--nn-ensemble", type=int, default=3, help="сколько сетей в ансамбле (1 = одна, как раньше)")
     p.add_argument("--nn-risk", type=float, default=1.0,
                    help="осторожность выбора: прогноз минус X × разброс между сетями (0 = просто среднее)")
@@ -985,7 +987,7 @@ def main():
     log.info("Нейросеть: решения %s%s | ансамбль %d сетей, осторожность %g | лимиты: маржа ≤ %g%% свободного баланса, "
              "убыток за сутки ≤ %g$", "ВКЛ" if a.nn else "выкл", " (AI_CONTROL)" if a.ai else "",
              a.nn_ensemble, a.nn_risk, a.ai_max_bal_pct, a.ai_day_loss)
-    web.update(ai_limits=("нейросеть (AI_CONTROL)" if a.ai else "нейросеть" if a.nn else "обычные настройки (--no-nn)")
+    web.update(ai_limits=("только нейросеть (AI_CONTROL)" if a.ai else "нейросеть" if a.nn else "обычные настройки (--no-nn)")
                + f" · маржа ≤ {a.ai_max_bal_pct:g}% свободного · стоп-день −{a.ai_day_loss:g}$")
     day_pnl()
     err = check_access(s, a)
@@ -1074,7 +1076,7 @@ def main():
                     try:
                         g = Grid(s, a, c, inst[c["symbol"]])
                     except ValueError as e:
-                        if not c.get("nn_fallback"):
+                        if not c.get("nn_fallback") or a.ai:
                             raise
                         # настройки сети не влезают в минимальный лот биржи — обычные настройки
                         log.info("%s; беру обычные настройки", e)
@@ -1091,8 +1093,11 @@ def main():
                 except ValueError as e:
                     log.info("%s", e)
             if not grid:
-                log.info("Подходящих пар нет, жду 60 сек")
-                web.update(state="подходящих монет нет, жду")
+                if a.ai and not (BRAIN and BRAIN.active) and not manual:
+                    web.update(state="только AI: нейросеть ещё не прошла проверку — сетки не открываю, жду")
+                else:
+                    log.info("Подходящих пар нет, жду 60 сек")
+                    web.update(state="подходящих монет нет, жду")
                 pause_wait(60)
                 continue
 
