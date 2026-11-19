@@ -35,6 +35,7 @@ Ctrl+C / остановка сервиса: бот снимет ордера и 
 """
 
 import argparse
+import json
 import logging
 import os
 import shlex
@@ -708,6 +709,8 @@ class Grid:
             log.error("%s: позиция ещё не закрыта, продолжаю догон лимитками", self.sym)
             return False
         log.info("%s: закрыто. Исполнений %d, сдвигов %d, PnL≈%.3f$", self.sym, self.fills, self.shifts, self.pnl())
+        if not self.a.dry:
+            day_pnl(self.pnl())
         if BRAIN and self.nn and self.notional > 0:
             pnl = self.pnl() - self.a.fee / 100 * abs(self.net) * self.price
             BRAIN.add_real(self.nn["feats"], pnl / self.notional * 100, self.nn.get("pred"), self.sym)
@@ -770,6 +773,62 @@ def balance(s):
     bal = float(next((c.get("walletBalance") for c in coins if c["coin"] == "USDT"), 0) or 0)
     web.update(balance=bal)
     return bal
+
+
+def available(s):
+    """Свободный баланс счёта (USDT), который ещё можно занять под маржу — с учётом других ботов на счёте."""
+    r = s.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+    acc = r["result"]["list"][0]
+    v = acc.get("totalAvailableBalance")
+    if v in (None, ""):
+        coins = acc.get("coin") or []
+        c = next((c for c in coins if c["coin"] == "USDT"), {})
+        v = c.get("availableToWithdraw") or c.get("walletBalance") or 0
+    return float(v or 0)
+
+
+DAY_FILE = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"), "day_pnl.json")
+
+
+def day_pnl(add=None):
+    """PnL закрытых сеток за текущие сутки UTC (хранится на диске — переживает перезапуск)."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    try:
+        with open(DAY_FILE) as f:
+            d = json.load(f)
+    except Exception:  # noqa: BLE001
+        d = {}
+    if d.get("date") != today:
+        d = {"date": today, "pnl": 0.0, "n": 0}
+    if add is not None:
+        d["pnl"] = float(d["pnl"]) + float(add)
+        d["n"] = int(d.get("n", 0)) + 1
+        try:
+            os.makedirs(os.path.dirname(DAY_FILE), exist_ok=True)
+            with open(DAY_FILE, "w") as f:
+                json.dump(d, f)
+        except Exception as e:  # noqa: BLE001
+            log.warning("PnL за сутки не сохранился: %s", e)
+    web.update(day_pnl=d["pnl"])
+    return d["pnl"]
+
+
+def cap_size(s, a, c):
+    """Лимит маржи: не больше --ai-max-bal-pct %% свободного баланса. Уменьшает c["size"]."""
+    if a.ai_max_bal_pct <= 0 or a.dry:
+        return c
+    try:
+        free = available(s)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Свободный баланс не получен (%s) — лимит маржи не проверен", e)
+        return c
+    lim = free * a.ai_max_bal_pct / 100
+    want = a.budget * float(c.get("size", 1.0))
+    if want > lim:
+        log.info("%s: маржа %.2f$ > лимита %.2f$ (%g%% свободных %.2f$) — уменьшаю",
+                 c["symbol"], want, lim, a.ai_max_bal_pct, free)
+        c = {**c, "size": max(0.0, lim / a.budget)}
+    return c
 
 
 def entry_max_vol(a):
@@ -845,6 +904,15 @@ def main():
     p.add_argument("--term-timeout", type=float, default=25, help="сек на догон при остановке сервиса")
     # нейросеть
     p.add_argument("--no-nn", dest="nn", action="store_false", help="не давать нейросети принимать решения (учится всё равно)")
+    p.add_argument("--ai", action="store_true", default=os.getenv("AI_CONTROL", "") == "1",
+                   help="полное управление нейросетью (перекрывает --no-nn); то же — переменная AI_CONTROL=1")
+    p.add_argument("--nn-ensemble", type=int, default=3, help="сколько сетей в ансамбле (1 = одна, как раньше)")
+    p.add_argument("--nn-risk", type=float, default=1.0,
+                   help="осторожность выбора: прогноз минус X × разброс между сетями (0 = просто среднее)")
+    p.add_argument("--ai-max-bal-pct", type=float, default=40,
+                   help="лимит: маржа одной сетки не больше X %% свободного баланса счёта (0 = выкл)")
+    p.add_argument("--ai-day-loss", type=float, default=10,
+                   help="лимит: убыток закрытых сеток за сутки (UTC) ≥ X$ — новые сетки до конца суток не открываю (0 = выкл)")
     p.add_argument("--nn-min-edge", type=float, default=0.02, help="брать сетку, если прогноз выше X %% от объёма")
     p.add_argument("--nn-symbols", type=int, default=40, help="монет для учёбы (сначала из сканера, потом ликвидные)")
     p.add_argument("--nn-window-hours", type=float, default=4, help="память: только последние N часов рынка")
@@ -886,6 +954,8 @@ def main():
     argv = sys.argv[1:] or normalize_args(os.getenv("BOT_ARGS", ""), p)
     a, unknown = p.parse_known_args(argv)
     a.max_levels = max(2, min(40, a.max_levels))
+    if a.ai:
+        a.nn = True
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S",
                         stream=sys.stdout, force=True)
@@ -912,6 +982,12 @@ def main():
     s = HTTP(testnet=not live, api_key=key, api_secret=sec)
     log.info("Режим: %s%s | маржа на сетку %s$, плечо %sx", "РЕАЛЬНЫЙ СЧЁТ" if live else "TESTNET",
              " (dry-run)" if a.dry else "", a.budget, a.leverage)
+    log.info("Нейросеть: решения %s%s | ансамбль %d сетей, осторожность %g | лимиты: маржа ≤ %g%% свободного баланса, "
+             "убыток за сутки ≤ %g$", "ВКЛ" if a.nn else "выкл", " (AI_CONTROL)" if a.ai else "",
+             a.nn_ensemble, a.nn_risk, a.ai_max_bal_pct, a.ai_day_loss)
+    web.update(ai_limits=("нейросеть (AI_CONTROL)" if a.ai else "нейросеть" if a.nn else "обычные настройки (--no-nn)")
+               + f" · маржа ≤ {a.ai_max_bal_pct:g}% свободного · стоп-день −{a.ai_day_loss:g}$")
+    day_pnl()
     err = check_access(s, a)
     if err:
         wait_forever(err)
@@ -934,6 +1010,7 @@ def main():
     cooldown = {}
     grid = None
     hot_logged = False
+    day_logged = False
     try:
         while True:
             if web.CONTROL["paused"]:
@@ -948,6 +1025,15 @@ def main():
                 web.set_symbol("")
                 web.CONTROL["msg"] = f"Монеты {manual} нет на Bybit (USDT-перп)"
                 manual = ""
+            if not manual and a.ai_day_loss > 0 and day_pnl() <= -a.ai_day_loss:
+                web.update(state="лимит убытка за сутки (%.2f$ ≤ −%g$) — новые сетки с 00:00 UTC" % (day_pnl(), a.ai_day_loss))
+                if not day_logged:
+                    log.warning("Лимит: убыток за сутки %.2f$ ≥ %g$ — новые сетки не открываю до 00:00 UTC",
+                                -day_pnl(), a.ai_day_loss)
+                    day_logged = True
+                pause_wait(60)
+                continue
+            day_logged = False
             if not manual:
                 hot = market_too_hot(a)
                 if hot:
@@ -983,6 +1069,7 @@ def main():
                 cands = [c for c in cands if cooldown.get(c["symbol"], 0) < now]
             grid = None
             for c in cands:
+                c = cap_size(s, a, c)
                 try:
                     try:
                         g = Grid(s, a, c, inst[c["symbol"]])
@@ -992,7 +1079,8 @@ def main():
                         # настройки сети не влезают в минимальный лот биржи — обычные настройки
                         log.info("%s; беру обычные настройки", e)
                         fb = c["nn_fallback"]
-                        c = {**c, "cfg": None, "size": 1.0, "grids": fb["levels"],
+                        c = {**c, "cfg": None, "size": min(1.0, float(c.get("size", 1.0))) if a.ai_max_bal_pct > 0 else 1.0,
+                             "grids": fb["levels"],
                              "nn": {"pred": fb["pred"], "feats": fb["feats"], "levels": fb["levels"], "cfg": None}}
                         g = Grid(s, a, c, inst[c["symbol"]])
                     if not a.dry and g.has_position():

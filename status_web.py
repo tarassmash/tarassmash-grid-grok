@@ -343,6 +343,8 @@ pre{{margin:0;max-height:420px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mo
   <div><span>Баланс USDT</span><b>{_fmt(s['balance'])}</b></div>
   <div><span>Маржа / плечо</span><b>{_fmt(s['budget'])} $ × {_fmt(s['leverage'])}</b></div>
   <div><span>Работает</span><b>{s['uptime_min']} мин</b></div>
+  <div><span>PnL за сутки (UTC)</span><b>{_fmt(s.get('day_pnl'), 2)} $</b></div>
+  <div><span>Управление</span><b>{escape(str(s.get('ai_limits') or ''))}</b></div>
 </div></div>
 <div class="panel"><h2>Текущая сетка</h2>{grid_html}</div>
 <div class="panel"><h2>Последний скан · {scan_t} · проверено {s['scan']['checked']}, подошло {s['scan']['passed']}</h2>

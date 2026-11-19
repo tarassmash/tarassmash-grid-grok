@@ -328,6 +328,51 @@ class MLP:
         return m
 
 
+class Ensemble:
+    """Несколько сетей с разным стартом, обученных на одних данных. Прогноз — среднее.
+    Для выбора настроек — осторожная оценка: среднее минус разброс между сетями (score).
+    Зачем: из ~6000 комбинаций одна сеть почти всегда находит ту, где сама случайно ошиблась вверх
+    («проклятие победителя»). Если сети не согласны — комбинации не доверяем."""
+
+    def __init__(self, n_in, k=3, hidden=(32, 16), seed=0, risk=1.0):
+        self.ms = [MLP(n_in, hidden, seed=seed * 101 + i) for i in range(k)]
+        self.risk = risk
+
+    def _all(self, X):
+        return np.stack([m.predict(X) for m in self.ms])
+
+    def predict(self, X):
+        return self._all(X).mean(0)
+
+    def score(self, X):
+        P = self._all(X)
+        return P.mean(0) - self.risk * P.std(0) if len(self.ms) > 1 else P[0]
+
+    def copy(self):
+        e = Ensemble.__new__(Ensemble)
+        e.ms, e.risk = [m.copy() for m in self.ms], self.risk
+        return e
+
+    def fit(self, X, y, w, Xv, yv, seed=0, on_epoch=None, **kw):
+        curves = []
+        for i, m in enumerate(self.ms):
+            cb = (lambda ep, n, i=i: on_epoch(ep, n, i, len(self.ms))) if on_epoch else None
+            curves.append(m.fit(X, y, w, Xv, yv, seed=seed * 101 + i, on_epoch=cb, **kw))
+        n = min(len(c) for c in curves)
+        return [{"epoch": j + 1, "train": float(np.mean([c[j]["train"] for c in curves])),
+                 "val": float(np.mean([c[j]["val"] for c in curves]))} for j in range(n)]
+
+    def to_json(self):
+        return {"ensemble": [m.to_json() for m in self.ms], "risk": self.risk}
+
+    @classmethod
+    def from_json(cls, d, risk=1.0):
+        e = cls.__new__(cls)
+        e.ms = [MLP.from_json(x) for x in d["ensemble"]] if "ensemble" in d else [MLP.from_json(d)]
+        e.risk = risk
+        return e
+
+
 # ---------------------------------------------------------------- «мозг»: учёба на ходу, решения
 
 class Brain:
@@ -470,7 +515,7 @@ class Brain:
             self.history = [h for h in d.get("history", []) if "src" in h]
             self.curve = d.get("curve", [])
             if d.get("model"):
-                self.model = MLP.from_json(d["model"])
+                self.model = Ensemble.from_json(d["model"], self.a.nn_risk)
                 self.mu, self.sd = np.array(d["mu"]), np.array(d["sd"])
             self.thoughts.extend(d.get("thoughts") or [])
             self.importance = d.get("importance") or []
@@ -670,7 +715,7 @@ class Brain:
                    "chosen": None, "pred": None, "took": None}
             if mdl is not None and t_end > self.trained_until:
                 X, _ = feature_matrix(base, self.allowed, a.max_levels)
-                p = mdl.predict((X - mu) / sd)
+                p = mdl.score((X - mu) / sd)
                 k = int(np.argmax(p))
                 cfg = ALL_CONFIGS[int(self.allowed[k])]
                 rec["pred"], rec["took"] = float(p[k]), bool(p[k] > a.nn_min_edge)
@@ -841,15 +886,15 @@ class Brain:
         Xt, yt, wt = X[:-n_val], y[:-n_val], w[:-n_val]
         Xv, yv = X[-n_val:], y[-n_val:]
         mu, sd = Xt.mean(0), Xt.std(0) + 1e-9
-        model = MLP(X.shape[1], seed=len(self.history))
+        model = Ensemble(X.shape[1], k=max(1, self.a.nn_ensemble), seed=len(self.history), risk=self.a.nn_risk)
 
-        def prog(ep, n):
-            self.progress = f"полное переобучение: эпоха {ep}/{n}"
+        def prog(ep, n, i=0, k=1):
+            self.progress = f"полное переобучение: сеть {i + 1}/{k}, эпоха {ep}/{n}"
         batch = 256 if len(yt) < 30_000 else 1024
         curve = model.fit((Xt - mu) / sd, yt, wt, (Xv - mu) / sd, yv, epochs=self.a.nn_epochs, batch=batch,
                           on_epoch=prog)
         # проверка на самом свежем куске, которого модель не видела: в каждом моменте — лучшая по прогнозу комбинация
-        pv = model.predict((Xv - mu) / sd)
+        pv = model.score((Xv - mu) / sd)
         gv, dv = g[-n_val:], dflt[-n_val:]
         o = np.lexsort((-pv, gv))
         _, first = np.unique(gv[o], return_index=True)
@@ -1038,7 +1083,7 @@ class Brain:
         if mdl is None:
             return {"best": (dflt, ld, None, fd), "default": (dflt, ld, None, fd), "top": [], "size": 1.0}
         X, levels = feature_matrix(base, self.allowed, self.a.max_levels)
-        p = mdl.predict((np.vstack([X, [vec(fd)]]) - mu) / sd)
+        p = mdl.score((np.vstack([X, [vec(fd)]]) - mu) / sd)
         pd_ = float(p[-1])
         p = p[:-1]
         order = np.argsort(-p)[:3]
